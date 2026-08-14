@@ -253,6 +253,29 @@ bash asm_check.sh      # 自动向量化/SIMD 指令检查
 
 原始数据：`results.csv`（C++23）、`results_rs.csv`（Rust）。
 
+## P3391 【模板】文艺平衡树：最优提交
+
+`p3391_submit.cpp` 用本仓库实测最快的 `sqrt_bitset` 直接提交：
+
+```bash
+g++ -O2 -std=c++17 p3391_submit.cpp -o p3391          # 纯标量（通用）
+g++ -O2 -mavx2 -std=c++17 p3391_submit.cpp -o p3391   # 有 AVX2 的评测机更快
+```
+
+实测（n=m=1e5，i9-13950HX，3 次取最小）：
+
+| 数据形态 | sqrt_bitset 标量 | sqrt_bitset AVX2 | splay（p3391_splay.cpp） |
+| --- | ---: | ---: | ---: |
+| 随机区间 | 105 ms | **74 ms** | 96 ms |
+| 全段反转 [1,n] | 72 ms | 58 ms | **25 ms** |
+| 固定 [1,n/2] | 128 ms | 71 ms | **20 ms** |
+| 固定 [n/4,3n/4] | 58 ms | 47 ms | **30 ms** |
+| 随机小区间 (64) | **48 ms** | 52 ms | 77 ms |
+
+全部远低于 P3391 的时限（通常 1–2 s），两份代码都已与暴力对拍。
+随机/小区间数据 `sqrt_bitset` 最快；重复固定边界的测试 splay 靠“边界节点
+被 splay 到根”的局部性更快，可按评测数据形态二选一。
+
 ## 目录
 
 - `bench.cpp` / `bench.rs`：同构的 7 方法 × 3 模式 benchmark
