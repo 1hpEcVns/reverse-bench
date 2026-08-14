@@ -255,26 +255,29 @@ bash asm_check.sh      # 自动向量化/SIMD 指令检查
 
 ## P3391 【模板】文艺平衡树：最优提交
 
-`p3391_submit.cpp` 用本仓库实测最快的 `sqrt_bitset` 直接提交：
+`p3391_submit.cpp` / `p3391_submit.rs` 用本仓库实测最快的 `sqrt_bitset`
+直接提交，两端都带快速 I/O（C++ fread/fwrite 缓冲；Rust read_to_end +
+手写解析 + 一次性 write_all）：
 
 ```bash
-g++ -O2 -std=c++17 p3391_submit.cpp -o p3391          # 纯标量（通用）
-g++ -O2 -mavx2 -std=c++17 p3391_submit.cpp -o p3391   # 有 AVX2 的评测机更快
+g++ -O2 -std=c++17 p3391_submit.cpp -o p3391          # C++ 纯标量（通用）
+g++ -O2 -mavx2 -std=c++17 p3391_submit.cpp -o p3391   # C++ 有 AVX2 的评测机更快
+rustc -O p3391_submit.rs -o p3391                     # Rust
 ```
 
 实测（n=m=1e5，i9-13950HX，3 次取最小）：
 
-| 数据形态 | sqrt_bitset 标量 | sqrt_bitset AVX2 | splay（p3391_splay.cpp） |
-| --- | ---: | ---: | ---: |
-| 随机区间 | 105 ms | **74 ms** | 96 ms |
-| 全段反转 [1,n] | 72 ms | 58 ms | **25 ms** |
-| 固定 [1,n/2] | 128 ms | 71 ms | **20 ms** |
-| 固定 [n/4,3n/4] | 58 ms | 47 ms | **30 ms** |
-| 随机小区间 (64) | **48 ms** | 52 ms | 77 ms |
+| 数据形态 | C++ 标量+快IO | C++ AVX2+快IO | Rust+快IO | splay |
+| --- | ---: | ---: | ---: | ---: |
+| 随机区间 | 88 ms | 78 ms | **69 ms** | 96 ms |
+| 全段反转 [1,n] | 54 ms | 38 ms | **29 ms** | 25 ms |
+| 固定 [1,n/2] | 115 ms | **42 ms** | 56 ms | 20 ms |
+| 固定 [n/4,3n/4] | 55 ms | **30 ms** | 47 ms | 30 ms |
+| 随机小区间 (64) | 20 ms | **15 ms** | 25 ms | 77 ms |
 
 全部远低于 P3391 的时限（通常 1–2 s），两份代码都已与暴力对拍。
-随机/小区间数据 `sqrt_bitset` 最快；重复固定边界的测试 splay 靠“边界节点
-被 splay 到根”的局部性更快，可按评测数据形态二选一。
+随机数据 Rust 最快，小区间 C++ AVX2 最快，重复固定边界的测试 splay 靠
+“边界节点被 splay 到根”的局部性更快，可按评测数据形态二选一。
 
 ## 目录
 

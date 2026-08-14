@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 #if defined(__AVX2__)
@@ -227,18 +228,88 @@ struct SqrtBitset {
     }
 };
 
+// ---------------- 快速 I/O（fread / fwrite 缓冲） ----------------
+struct FastIn {
+    static constexpr std::size_t N = 1 << 16;
+    char buf[N];
+    std::size_t p = 0, len = 0;
+
+    inline char get() {
+        if (p == len) {
+            len = fread(buf, 1, N, stdin);
+            p = 0;
+            if (!len) return 0;
+        }
+        return buf[p++];
+    }
+
+    bool read(int& x) {
+        char c = get();
+        while (c && c <= ' ') c = get();
+        if (!c) return false;
+        int sgn = 1;
+        if (c == '-') {
+            sgn = -1;
+            c = get();
+        }
+        x = 0;
+        while (c > ' ') {
+            x = x * 10 + (c - '0');
+            c = get();
+        }
+        x *= sgn;
+        return true;
+    }
+};
+
+struct FastOut {
+    static constexpr std::size_t N = 1 << 16;
+    char buf[N];
+    std::size_t p = 0;
+
+    ~FastOut() { flush(); }
+
+    inline void flush() {
+        if (p) {
+            fwrite(buf, 1, p, stdout);
+            p = 0;
+        }
+    }
+
+    inline void put(char c) {
+        if (p == N) flush();
+        buf[p++] = c;
+    }
+
+    void write_u32(u32 x) {
+        char tmp[12];
+        int i = 12;
+        do {
+            tmp[--i] = char('0' + x % 10);
+            x /= 10;
+        } while (x);
+        while (i < 12) put(tmp[i++]);
+    }
+};
+
 int main() {
+    FastIn in;
+    FastOut out;
     int n, m;
-    if (scanf("%d%d", &n, &m) != 2) return 0;
+    if (!in.read(n) || !in.read(m)) return 0;
     SqrtBitset sol((u32)n);
     for (int i = 0; i < m; ++i) {
         int l, r;
-        scanf("%d%d", &l, &r);
+        in.read(l);
+        in.read(r);
         sol.reverse((u32)l - 1, (u32)r - 1);
     }
-    std::vector<u32> out;
-    sol.collect(out);
-    for (u32 i = 0; i < (u32)out.size(); ++i)
-        printf("%u%c", out[i], i + 1 == out.size() ? '\n' : ' ');
+    std::vector<u32> outv;
+    sol.collect(outv);
+    for (u32 i = 0; i < (u32)outv.size(); ++i) {
+        if (i) out.put(' ');
+        out.write_u32(outv[i]);
+    }
+    out.put('\n');
     return 0;
 }
