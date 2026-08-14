@@ -11,6 +11,7 @@ COLORS = {
     "treap": "#1f77b4",
     "splay": "#9467bd",
     "sqrt": "#8c564b",
+    "sqrt_phys": "#17becf",
 }
 MARKERS = {
     "brute": "o",
@@ -19,7 +20,9 @@ MARKERS = {
     "treap": "D",
     "splay": "v",
     "sqrt": "X",
+    "sqrt_phys": "P",
 }
+METHODS = ["brute", "std", "avx2", "treap", "splay", "sqrt", "sqrt_phys"]
 
 
 def load(path):
@@ -59,11 +62,24 @@ class Table:
 def pivot(df, mode):
     key = "n" if mode == "batch" else "L"
     xs = sorted({df[key][i] for i in range(len(df["mode"])) if df["mode"][i] == mode})
-    data = {m: {} for m in ["brute", "std", "avx2", "treap", "splay", "sqrt"]}
+    data = {m: {} for m in METHODS}
     for i in range(len(df["mode"])):
         if df["mode"][i] == mode:
             data[df["method"][i]][df[key][i]] = df["val"][i]
     return Table(xs, data)
+
+
+def pivot_bsweep(df):
+    ns = sorted({df["n"][i] for i in range(len(df["mode"])) if df["mode"][i] == "bsweep"})
+    bs = sorted({df["L"][i] for i in range(len(df["mode"])) if df["mode"][i] == "bsweep"})
+    out = {}
+    for n in ns:
+        data = {m: {} for m in ["sqrt", "sqrt_phys"]}
+        for i in range(len(df["mode"])):
+            if df["mode"][i] == "bsweep" and df["n"][i] == n:
+                data[df["method"][i]][df["L"][i]] = df["val"][i]
+        out[n] = Table(bs, data)
+    return out
 
 
 def brute_best(sub):
@@ -102,13 +118,14 @@ def draw_best(ax, sub, ylabel, title, tag):
     xs = sub.index
     bb = brute_best(sub)
     tb = tree_best(sub)
-    sq = sub["sqrt"]
     ax.plot(xs, bb, marker="o", markersize=4, linewidth=1.5, color="#d62728",
             label="brute best (scalar/std/AVX2)")
     ax.plot(xs, tb, marker="s", markersize=4, linewidth=1.5, color="#1f77b4",
             label="tree best (treap/splay)")
-    ax.plot(xs, sq, marker="X", markersize=4, linewidth=1.5, color="#8c564b",
-            label="sqrt (块状链表)")
+    ax.plot(xs, sub["sqrt"], marker="X", markersize=4, linewidth=1.5, color="#8c564b",
+            label="sqrt (lazy)")
+    ax.plot(xs, sub["sqrt_phys"], marker="P", markersize=4, linewidth=1.5,
+            color="#17becf", linestyle="--", label="sqrt_phys (SIMD, no lazy)")
     ax.set_xscale("log", base=2)
     ax.set_yscale("log")
     ax.set_title(title)
@@ -117,8 +134,8 @@ def draw_best(ax, sub, ylabel, title, tag):
     ax.grid(True, which="both", alpha=0.25)
     ax.legend(fontsize=8, loc="upper left")
     cb = crossover(xs, bb, tb)
-    note = f"{tag}: brute ≤ {cb[0]} / tree ≥ {cb[1]}" if cb else f"{tag}: no brute/tree crossover"
-    ax.annotate(note, xy=(0.03, 0.88), xytext=(0.03, 0.88),
+    note = f"{tag}: brute <= {cb[0]} / tree >= {cb[1]}" if cb else f"{tag}: no brute/tree crossover"
+    ax.annotate(note, xy=(0.03, 0.82), xytext=(0.03, 0.82),
                 textcoords="axes fraction", fontsize=9, color="#1f77b4")
     return cb
 
@@ -138,29 +155,45 @@ def ratio_axes(ax, sub_cpp, sub_rs, method, title):
                 textcoords="axes fraction", fontsize=8, color="gray")
 
 
+def draw_bsweep(ax, sub, title):
+    xs = sub.index
+    for m in ["sqrt", "sqrt_phys"]:
+        ax.plot(xs, sub[m], marker=MARKERS[m], markersize=5, linewidth=1.5,
+                color=COLORS[m], label=m)
+    ax.set_xscale("log", base=2)
+    ax.set_yscale("log")
+    ax.set_xticks([1] + [64, 128, 256, 512, 1024, 2048, 4096])
+    ax.set_xticklabels(["auto"] + ["64", "128", "256", "512", "1k", "2k", "4k"])
+    ax.set_title(title)
+    ax.set_xlabel("block size B")
+    ax.set_ylabel("ms / run (5000 ops + output)")
+    ax.grid(True, which="both", alpha=0.25)
+    ax.legend(fontsize=8, loc="upper right")
+
+
 def main():
     cpp = load("results.csv")
     rs = load("results_rs.csv")
     lc, lr = pivot(cpp, "length"), pivot(rs, "length")
     bc, br = pivot(cpp, "batch"), pivot(rs, "batch")
+    bsc, bsr = pivot_bsweep(cpp), pivot_bsweep(rs)
 
-    # length: 单次反转 per-op 成本
     fig, ax = plt.subplots(1, 1, figsize=(9, 6))
-    draw_all(ax, lc, "ns / op", "C++23 — 单次区间反转成本 (N=2^20)")
+    draw_all(ax, lc, "ns / op", "C++23 - single reversal (N=2^20)")
     fig.tight_layout()
     fig.savefig("cpp23_length.webp", dpi=150)
     plt.close(fig)
 
     fig, ax = plt.subplots(1, 1, figsize=(9, 6))
-    draw_all(ax, lr, "ns / op", "Rust — 单次区间反转成本 (N=2^20)")
+    draw_all(ax, lr, "ns / op", "Rust - single reversal (N=2^20)")
     fig.tight_layout()
     fig.savefig("rust_length.webp", dpi=150)
     plt.close(fig)
 
     fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-    cb1 = draw_best(axes[0], lc, "ns / op", "C++23 best", "C++23")
-    cb2 = draw_best(axes[1], lr, "ns / op", "Rust best", "Rust")
-    fig.suptitle("Brute best vs balanced-tree best vs sqrt (single reversal)", fontsize=14)
+    draw_best(axes[0], lc, "ns / op", "C++23 best", "C++23")
+    draw_best(axes[1], lr, "ns / op", "Rust best", "Rust")
+    fig.suptitle("Brute best vs tree best vs sqrt / sqrt_phys (single reversal)", fontsize=14)
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     fig.savefig("best_length.webp", dpi=150)
     plt.close(fig)
@@ -168,44 +201,58 @@ def main():
     fig, axes = plt.subplots(2, 3, figsize=(16, 9))
     for ax, m in zip(axes.flat, ["brute", "std", "avx2", "treap", "splay", "sqrt"]):
         ratio_axes(ax, lc, lr, m, f"{m} C++/Rust ratio (length)")
-    fig.suptitle("C++ vs Rust — 单次反转 per-op 比值", fontsize=14)
+    fig.suptitle("C++ vs Rust - per-op ratio", fontsize=14)
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     fig.savefig("cpp_vs_rust_length.webp", dpi=150)
     plt.close(fig)
 
-    # batch: 完整流水线
     fig, ax = plt.subplots(1, 1, figsize=(9, 6))
-    draw_all(ax, bc, "ms / run", "C++23 — 5000 次随机反转 + 输出 (ms)")
+    draw_all(ax, bc, "ms / run", "C++23 - 5000 random reversals + output (ms)")
     fig.tight_layout()
     fig.savefig("cpp23_batch.webp", dpi=150)
     plt.close(fig)
 
     fig, ax = plt.subplots(1, 1, figsize=(9, 6))
-    draw_all(ax, br, "ms / run", "Rust — 5000 次随机反转 + 输出 (ms)")
+    draw_all(ax, br, "ms / run", "Rust - 5000 random reversals + output (ms)")
     fig.tight_layout()
     fig.savefig("rust_batch.webp", dpi=150)
     plt.close(fig)
 
     fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-    cb3 = draw_best(axes[0], bc, "ms / run", "C++23 best", "C++23")
-    cb4 = draw_best(axes[1], br, "ms / run", "Rust best", "Rust")
-    fig.suptitle("Brute best vs balanced-tree best vs sqrt (5000 random reversals + output)", fontsize=14)
+    draw_best(axes[0], bc, "ms / run", "C++23 best", "C++23")
+    draw_best(axes[1], br, "ms / run", "Rust best", "Rust")
+    fig.suptitle("Brute best vs tree best vs sqrt / sqrt_phys (5000 ops + output)", fontsize=14)
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     fig.savefig("best_batch.webp", dpi=150)
     plt.close(fig)
 
-    print("== length 模式临界点（L：反转长度，N=2^20） ==")
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    draw_bsweep(axes[0][0], bsc[1 << 16], "C++23 block-size sweep, n=2^16")
+    draw_bsweep(axes[0][1], bsr[1 << 16], "Rust block-size sweep, n=2^16")
+    draw_bsweep(axes[1][0], bsc[1 << 20], "C++23 block-size sweep, n=2^20")
+    draw_bsweep(axes[1][1], bsr[1 << 20], "Rust block-size sweep, n=2^20")
+    fig.suptitle("Block-size sweep: lazy sqrt vs physical SIMD sqrt_phys", fontsize=14)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.savefig("bsweep_batch.webp", dpi=150)
+    plt.close(fig)
+
+    print("== length crossover (L, N=2^20) ==")
     for tag, sub in [("C++23", lc), ("Rust", lr)]:
-        cb = crossover(sub.index, brute_best(sub), tree_best(sub))
-        print(f"{tag}: brute_best vs tree_best -> {cb}")
-        sq_cross = crossover(sub.index, brute_best(sub), sub["sqrt"])
-        print(f"{tag}: brute_best vs sqrt -> {sq_cross}")
-    print("== batch 模式临界点（n：数组大小，m=5000） ==")
+        print(f"{tag}: brute_best vs tree_best -> {crossover(sub.index, brute_best(sub), tree_best(sub))}")
+        print(f"{tag}: brute_best vs sqrt -> {crossover(sub.index, brute_best(sub), sub['sqrt'])}")
+        print(f"{tag}: brute_best vs sqrt_phys -> {crossover(sub.index, brute_best(sub), sub['sqrt_phys'])}")
+    print("== batch crossover (n, m=5000) ==")
     for tag, sub in [("C++23", bc), ("Rust", br)]:
-        cb = crossover(sub.index, brute_best(sub), tree_best(sub))
-        print(f"{tag}: brute_best vs tree_best -> {cb}")
-        sq_cross = crossover(sub.index, brute_best(sub), sub["sqrt"])
-        print(f"{tag}: brute_best vs sqrt -> {sq_cross}")
+        print(f"{tag}: brute_best vs tree_best -> {crossover(sub.index, brute_best(sub), tree_best(sub))}")
+        print(f"{tag}: brute_best vs sqrt -> {crossover(sub.index, brute_best(sub), sub['sqrt'])}")
+        print(f"{tag}: brute_best vs sqrt_phys -> {crossover(sub.index, brute_best(sub), sub['sqrt_phys'])}")
+    print("== bsweep best B (ms, 5000 ops + output) ==")
+    for tag, d in [("C++23", bsc), ("Rust", bsr)]:
+        for n in [1 << 16, 1 << 20]:
+            for m in ["sqrt", "sqrt_phys"]:
+                sub = d[n]
+                best_i = int(np.argmin(sub[m]))
+                print(f"{tag} n={n}: {m} best B={sub.index[best_i]} ({sub[m][best_i]:.3f} ms)")
 
 
 if __name__ == "__main__":

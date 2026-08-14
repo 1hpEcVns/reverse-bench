@@ -493,9 +493,10 @@ struct Sqrt {
 }
 
 impl Sqrt {
-    fn new(a: &[u32], _seed: u64) -> Sqrt {
+    fn new(a: &[u32], _seed: u64, block_size: u32) -> Sqrt {
         let n = a.len() as f64;
-        let b = ((n.sqrt() * 2.0) as u32).clamp(64, 1024) as usize;
+        let auto = ((n.sqrt() * 2.0) as u32).clamp(64, 1024);
+        let b = (if block_size != 0 { block_size } else { auto }) as usize;
         let mut blocks = Vec::new();
         let mut i = 0usize;
         while i < a.len() {
@@ -524,7 +525,8 @@ impl Sqrt {
     fn materialize(&mut self, i: u32) {
         let (v, rev) = &mut self.blocks[i as usize];
         if *rev {
-            v.reverse();
+            let len = v.len();
+            unsafe { reverse_avx2(v, 0, len) };
             *rev = false;
         }
     }
@@ -539,22 +541,64 @@ impl Sqrt {
         self.blocks.insert(i as usize + 1, nb);
     }
 
+    // 块长调节：过小的块与邻居合并（合并前先 materialize，保证物理顺序一致）。
+    fn merge_small(&mut self, i: u32) {
+        let sz = self.blocks[i as usize].0.len();
+        if sz >= self.b as usize / 2 {
+            return;
+        }
+        let ii = i as usize;
+        if ii > 0 {
+            let left = self.blocks[ii - 1].0.len();
+            if left + sz <= 2 * self.b as usize {
+                self.materialize((ii - 1) as u32);
+                self.materialize(i);
+                let mut rhs = std::mem::take(&mut self.blocks[ii].0);
+                self.blocks[ii - 1].0.append(&mut rhs);
+                self.blocks[ii - 1].1 = false;
+                self.blocks.remove(ii);
+                return;
+            }
+        }
+        if ii + 1 < self.blocks.len() {
+            let right = self.blocks[ii + 1].0.len();
+            if sz + right <= 2 * self.b as usize {
+                self.materialize(i);
+                self.materialize((ii + 1) as u32);
+                let mut rhs = std::mem::take(&mut self.blocks[ii + 1].0);
+                self.blocks[ii].0.append(&mut rhs);
+                self.blocks[ii].1 = false;
+                self.blocks.remove(ii + 1);
+            }
+        }
+    }
+
+    fn rebalance(&mut self, i: u32) {
+        if self.blocks[i as usize].0.len() > 2 * self.b as usize {
+            self.split_block(i);
+        } else {
+            self.merge_small(i);
+        }
+    }
+
     fn reverse(&mut self, l: u32, r: u32) {
         let (bi, oi) = self.find(l);
         let (bj, oj) = self.find(r);
         if bi == bj {
             self.materialize(bi);
             let (v, _) = &mut self.blocks[bi as usize];
-            v[oi as usize..=oj as usize].reverse();
+            unsafe { reverse_avx2(v, oi as usize, oj as usize + 1) };
             return;
         }
         self.materialize(bi);
         self.materialize(bj);
         let nr = (oj + 1) as usize;
         let mut rp = self.blocks[bj as usize].0[..nr].to_vec();
-        rp.reverse();
+        let rp_len = rp.len();
+        unsafe { reverse_avx2(&mut rp, 0, rp_len) };
         let mut lp = self.blocks[bi as usize].0[oi as usize..].to_vec();
-        lp.reverse();
+        let lp_len = lp.len();
+        unsafe { reverse_avx2(&mut lp, 0, lp_len) };
         let tail = self.blocks[bj as usize].0[(oj + 1) as usize..].to_vec();
         self.blocks[bi as usize].0.truncate(oi as usize);
         self.blocks[bi as usize].0.extend_from_slice(&rp);
@@ -565,9 +609,9 @@ impl Sqrt {
         for i in (bi + 1)..bj {
             self.blocks[i as usize].1 ^= true;
         }
-        // 先拆大下标，避免插入导致另一个下标失效
-        self.split_block(bj);
-        self.split_block(bi);
+        // 先处理大下标，避免增删块导致另一个下标失效
+        self.rebalance(bj);
+        self.rebalance(bi);
     }
 
     fn collect(&self, out: &mut Vec<u32>) {
@@ -586,8 +630,133 @@ impl Sqrt {
     }
 }
 
+// ---------------- 物理 SIMD 块状链表（无懒标记） ----------------
+// 上层（整块）与下层（散块）用同一个 reverse_avx2 内核，块内容始终物理有序；
+// 整块反转 = 逐块 SIMD 就地反转 + 块列表顺序反转（O(#blocks) 指针搬移）。
+struct SqrtPhys {
+    blocks: Vec<Vec<u32>>,
+    b: u32,
+}
+
+impl SqrtPhys {
+    fn new(a: &[u32], _seed: u64, block_size: u32) -> SqrtPhys {
+        let n = a.len() as f64;
+        let auto = ((n.sqrt() * 2.0) as u32).clamp(64, 1024);
+        let b = (if block_size != 0 { block_size } else { auto }) as usize;
+        let mut blocks = Vec::new();
+        let mut i = 0usize;
+        while i < a.len() {
+            let e = (i + b).min(a.len());
+            blocks.push(a[i..e].to_vec());
+            i = e;
+        }
+        SqrtPhys {
+            blocks,
+            b: b as u32,
+        }
+    }
+
+    fn find(&self, mut k: u32) -> (u32, u32) {
+        for (i, v) in self.blocks.iter().enumerate() {
+            let s = v.len() as u32;
+            if k < s {
+                return (i as u32, k);
+            }
+            k -= s;
+        }
+        (0, 0)
+    }
+
+    fn split_block(&mut self, i: u32) {
+        let s = self.blocks[i as usize].len();
+        if s <= 2 * self.b as usize {
+            return;
+        }
+        let half = s / 2;
+        let nb = self.blocks[i as usize].split_off(half);
+        self.blocks.insert(i as usize + 1, nb);
+    }
+
+    fn merge_small(&mut self, i: u32) {
+        let sz = self.blocks[i as usize].len();
+        if sz >= self.b as usize / 2 {
+            return;
+        }
+        let ii = i as usize;
+        if ii > 0 {
+            let left = self.blocks[ii - 1].len();
+            if left + sz <= 2 * self.b as usize {
+                let mut rhs = std::mem::take(&mut self.blocks[ii]);
+                self.blocks[ii - 1].append(&mut rhs);
+                self.blocks.remove(ii);
+                return;
+            }
+        }
+        if ii + 1 < self.blocks.len() {
+            let right = self.blocks[ii + 1].len();
+            if sz + right <= 2 * self.b as usize {
+                let mut rhs = std::mem::take(&mut self.blocks[ii + 1]);
+                self.blocks[ii].append(&mut rhs);
+                self.blocks.remove(ii + 1);
+            }
+        }
+    }
+
+    fn rebalance(&mut self, i: u32) {
+        if self.blocks[i as usize].len() > 2 * self.b as usize {
+            self.split_block(i);
+        } else {
+            self.merge_small(i);
+        }
+    }
+
+    fn reverse(&mut self, l: u32, r: u32) {
+        let (bi, oi) = self.find(l);
+        let (bj, oj) = self.find(r);
+        if bi == bj {
+            unsafe { reverse_avx2(&mut self.blocks[bi as usize], oi as usize, oj as usize + 1) };
+            return;
+        }
+        // 散块就地 SIMD 反转
+        unsafe {
+            let bi_len = self.blocks[bi as usize].len();
+            reverse_avx2(&mut self.blocks[bi as usize], oi as usize, bi_len);
+            let bj_len = oj as usize + 1;
+            reverse_avx2(&mut self.blocks[bj as usize], 0, bj_len);
+        }
+        // 中间整块逐个就地 SIMD 反转（上层与下层同一内核）
+        for i in (bi + 1)..bj {
+            let (v, len) = {
+                let v = &mut self.blocks[i as usize];
+                (v as *mut Vec<u32>, v.len())
+            };
+            unsafe { reverse_avx2(&mut *v, 0, len) };
+        }
+        // 反转块列表顺序（纯指针搬移，无数据 SIMD，但无懒标记）
+        self.blocks[(bi + 1) as usize..bj as usize].reverse();
+        // 端块内容交换：bi = 原前缀[0,oi) + 已反转右散块；bj = 已反转左散块 + 原后缀
+        let nr = (oj + 1) as usize;
+        let rp = self.blocks[bj as usize][..nr].to_vec();
+        let lp = self.blocks[bi as usize][oi as usize..].to_vec();
+        let tail = self.blocks[bj as usize][nr..].to_vec();
+        self.blocks[bi as usize].truncate(oi as usize);
+        self.blocks[bi as usize].extend_from_slice(&rp);
+        self.blocks[bj as usize] = lp;
+        self.blocks[bj as usize].extend_from_slice(&tail);
+        self.rebalance(bj);
+        self.rebalance(bi);
+    }
+
+    fn collect(&self, out: &mut Vec<u32>) {
+        out.clear();
+        for v in &self.blocks {
+            out.extend_from_slice(v);
+        }
+    }
+}
+
 // ---------------- 方法分发 ----------------
-const METHODS: [&str; 6] = ["brute", "std", "avx2", "treap", "splay", "sqrt"];
+const METHODS: [&str; 7] = ["brute", "std", "avx2", "treap", "splay", "sqrt", "sqrt_phys"];
 
 #[inline(always)]
 unsafe fn apply_reverse(m: usize, a: &mut [u32], l: u32, r: u32) {
@@ -604,10 +773,11 @@ enum DS {
     Treap(Treap),
     Splay(Splay),
     Sqrt(Sqrt),
+    SqrtPhys(SqrtPhys),
 }
 
 impl DS {
-    fn new(m: usize, a: &[u32], seed: u64) -> DS {
+    fn new(m: usize, a: &[u32], seed: u64, block_size: u32) -> DS {
         match m {
             0 | 1 | 2 => DS::Array {
                 a: a.to_vec(),
@@ -615,7 +785,8 @@ impl DS {
             },
             3 => DS::Treap(Treap::new(a, seed)),
             4 => DS::Splay(Splay::new(a, seed)),
-            5 => DS::Sqrt(Sqrt::new(a, seed)),
+            5 => DS::Sqrt(Sqrt::new(a, seed, block_size)),
+            6 => DS::SqrtPhys(SqrtPhys::new(a, seed, block_size)),
             _ => unreachable!(),
         }
     }
@@ -626,6 +797,7 @@ impl DS {
             DS::Treap(t) => t.reverse(l, r),
             DS::Splay(s) => s.reverse(l, r),
             DS::Sqrt(q) => q.reverse(l, r),
+            DS::SqrtPhys(q) => q.reverse(l, r),
         }
     }
 
@@ -638,6 +810,7 @@ impl DS {
             DS::Treap(t) => t.collect(out),
             DS::Splay(s) => s.collect(out),
             DS::Sqrt(q) => q.collect(out),
+            DS::SqrtPhys(q) => q.collect(out),
         }
     }
 
@@ -662,7 +835,7 @@ fn verify_length(m: usize, n: u32, l: u32) {
         let st = rnd(&mut s, n - l + 1);
         let r = st + l; // [st, r) 半开
         unsafe { reverse_scalar(&mut a, st as usize, r as usize) };
-        let mut ds = DS::new(m, &b, seed);
+        let mut ds = DS::new(m, &b, seed, 0);
         ds.reverse(st, r - 1);
         ds.collect(&mut got);
         if got != a {
@@ -673,12 +846,12 @@ fn verify_length(m: usize, n: u32, l: u32) {
     }
 }
 
-fn verify_batch(m: usize, n: u32, tmpl: &[u32]) {
+fn verify_batch(m: usize, n: u32, tmpl: &[u32], block_size: u32) {
     if m == 0 {
         return;
     }
     let mut a = tmpl.to_vec();
-    let mut ds = DS::new(m, tmpl, 0xdead_beef ^ m as u64 ^ n as u64);
+    let mut ds = DS::new(m, tmpl, 0xdead_beef ^ m as u64 ^ n as u64, block_size);
     let mut s = 0xabcd_ef01_2345_6789u64 ^ m as u64 ^ n as u64;
     for _ in 0..200 {
         let mut l = rnd(&mut s, n);
@@ -699,7 +872,7 @@ fn verify_batch(m: usize, n: u32, tmpl: &[u32]) {
 
 // ---------------- length 模式 ----------------
 fn time_length_once(m: usize, tmpl: &[u32], l: u32, q: u64, seed: u64, w: &[u64]) -> f64 {
-    let mut ds = DS::new(m, tmpl, seed ^ 0x5eed);
+    let mut ds = DS::new(m, tmpl, seed ^ 0x5eed, 0);
     let mut s = seed;
     let t0 = Instant::now();
     for _ in 0..q {
@@ -757,9 +930,9 @@ fn measure_length() {
 }
 
 // ---------------- batch 模式 ----------------
-fn time_batch_once(m: usize, n: u32, tmpl: &[u32], seed: u64, w: &[u64]) -> f64 {
+fn time_batch_once(m: usize, n: u32, tmpl: &[u32], seed: u64, w: &[u64], block_size: u32) -> f64 {
     let t0 = Instant::now();
-    let mut ds = DS::new(m, tmpl, seed ^ 0xbeef);
+    let mut ds = DS::new(m, tmpl, seed ^ 0xbeef, block_size);
     let mut s = seed;
     for _ in 0..OPS {
         let mut l = rnd(&mut s, n);
@@ -784,7 +957,7 @@ fn measure_batch() {
         let mut wseed = 0x8888_8888_8888_8888u64 ^ n as u64;
         let w: Vec<u64> = (0..n).map(|_| splitmix64(&mut wseed)).collect();
         for m in 0..METHODS.len() {
-            verify_batch(m, n, &tmpl);
+            verify_batch(m, n, &tmpl, 0);
         }
         for m in 0..METHODS.len() {
             let mut times = Vec::new();
@@ -795,6 +968,7 @@ fn measure_batch() {
                     &tmpl,
                     0x3333 ^ m as u64 ^ n as u64 ^ ((r as u64) << 32),
                     &w,
+                    0,
                 ));
             }
             let ms = median(times);
@@ -804,14 +978,47 @@ fn measure_batch() {
     }
 }
 
+// ---------------- bsweep 模式：固定 batch 场景扫块长 B ----------------
+fn measure_bsweep() {
+    let bs: [u32; 8] = [64, 128, 256, 512, 1024, 2048, 4096, 0]; // 0 = auto
+    for n in [1u32 << 16, 1 << 20] {
+        let mut seed = 0x0bad_c0deu64 ^ n as u64;
+        let tmpl: Vec<u32> = (0..n).map(|_| (splitmix64(&mut seed) & 0xffff) as u32).collect();
+        let mut wseed = 0x9999_9999_9999_9999u64 ^ n as u64;
+        let w: Vec<u64> = (0..n).map(|_| splitmix64(&mut wseed)).collect();
+        for &b in &bs {
+            for m in [5usize, 6] {
+                verify_batch(m, n, &tmpl, b);
+                let mut times = Vec::new();
+                for r in 0..ROUNDS {
+                    times.push(time_batch_once(
+                        m,
+                        n,
+                        &tmpl,
+                        0x4444 ^ m as u64 ^ n as u64 ^ b as u64 ^ ((r as u64) << 32),
+                        &w,
+                        b,
+                    ));
+                }
+                let ms = median(times);
+                println!("bsweep,{},{},{},{:.3}", n, b, METHODS[m], ms);
+            }
+        }
+    }
+}
+
 fn main() {
     let arg = std::env::args().nth(1).unwrap_or_default();
     let only_length = arg == "length";
     let only_batch = arg == "batch";
-    if !only_batch {
+    let only_bsweep = arg == "bsweep";
+    if !only_batch && !only_bsweep {
         measure_length();
     }
-    if !only_length {
+    if !only_length && !only_bsweep {
         measure_batch();
+    }
+    if only_bsweep {
+        measure_bsweep();
     }
 }

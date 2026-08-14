@@ -364,8 +364,9 @@ struct Sqrt {
     std::vector<Block> b;
     u32 B;
 
-    Sqrt(const u32* a, usize n, u64) {
-        B = std::max(64u, std::min(1024u, (u32)(std::sqrt((double)n) * 2.0)));
+    Sqrt(const u32* a, usize n, u64, u32 block_size = 0) {
+        B = block_size ? block_size
+                       : std::max(64u, std::min(1024u, (u32)(std::sqrt((double)n) * 2.0)));
         for (usize i = 0; i < n;) {
             Block bl;
             bl.rev = 0;
@@ -387,7 +388,7 @@ struct Sqrt {
 
     inline void materialize(u32 i) {
         if (b[i].rev) {
-            std::reverse(b[i].v.begin(), b[i].v.end());
+            reverse_avx2(b[i].v.data(), 0, b[i].v.size());
             b[i].rev = 0;
         }
     }
@@ -403,21 +404,46 @@ struct Sqrt {
         b.insert(b.begin() + i + 1, std::move(nb));
     }
 
+    // 块长调节：过小的块与邻居合并（合并后仍超 2B 由 split_block 处理）。
+    void merge_small(u32 i) {
+        if (b[i].v.size() >= B / 2) return;
+        if (i > 0 && b[i - 1].v.size() + b[i].v.size() <= 2 * B) {
+            materialize(i - 1);  // 邻居可能是带懒标记的中间块，先物理化
+            materialize(i);
+            b[i - 1].v.insert(b[i - 1].v.end(), b[i].v.begin(), b[i].v.end());
+            b.erase(b.begin() + i);
+            return;
+        }
+        if (i + 1 < b.size() && b[i].v.size() + b[i + 1].v.size() <= 2 * B) {
+            materialize(i + 1);
+            materialize(i);
+            b[i].v.insert(b[i].v.end(), b[i + 1].v.begin(), b[i + 1].v.end());
+            b.erase(b.begin() + i + 1);
+        }
+    }
+
+    void rebalance(u32 i) {
+        if (b[i].v.size() > 2 * B)
+            split_block(i);
+        else
+            merge_small(i);
+    }
+
     void reverse(u32 l, u32 r) {  // 元素下标 [l, r]（含端点）
         auto [bi, oi] = find(l);
         auto [bj, oj] = find(r);
         if (bi == bj) {
             materialize(bi);
-            std::reverse(b[bi].v.begin() + oi, b[bi].v.begin() + oj + 1);
+            reverse_avx2(b[bi].v.data(), oi, (usize)oj + 1);
             return;
         }
         materialize(bi);
         materialize(bj);
         u32 nr = oj + 1;  // 右散块参与翻转的前缀长度
         std::vector<u32> rp(b[bj].v.begin(), b[bj].v.begin() + nr);
-        std::reverse(rp.begin(), rp.end());
+        reverse_avx2(rp.data(), 0, rp.size());
         std::vector<u32> lp(b[bi].v.begin() + oi, b[bi].v.end());
-        std::reverse(lp.begin(), lp.end());
+        reverse_avx2(lp.data(), 0, lp.size());
         b[bi].v.resize(oi);
         b[bi].v.insert(b[bi].v.end(), rp.begin(), rp.end());
         std::vector<u32> tail(b[bj].v.begin() + oj + 1, b[bj].v.end());
@@ -426,9 +452,9 @@ struct Sqrt {
         // 中间整块：先反转块列表顺序，再逐块翻转（懒标记）
         std::reverse(b.begin() + bi + 1, b.begin() + bj);
         for (u32 i = bi + 1; i < bj; ++i) b[i].rev ^= 1;
-        // 先拆大下标，避免插入导致另一个下标失效
-        split_block(bj);
-        split_block(bi);
+        // 先处理大下标，避免增删块导致另一个下标失效
+        rebalance(bj);
+        rebalance(bi);
     }
 
     void collect(std::vector<u32>& out) const {
@@ -442,10 +468,106 @@ struct Sqrt {
     }
 };
 
+// ---------------- 物理 SIMD 块状链表（无懒标记） ----------------
+// 上层（整块）与下层（散块）用同一个 reverse_avx2 内核，块内容始终物理有序；
+// 整块反转 = 逐块 SIMD 就地反转 + 块列表顺序反转（O(#blocks) 指针搬移）。
+struct SqrtPhys {
+    struct Block {
+        std::vector<u32> v;
+    };
+    std::vector<Block> b;
+    u32 B;
+
+    SqrtPhys(const u32* a, usize n, u64, u32 block_size = 0) {
+        B = block_size ? block_size
+                       : std::max(64u, std::min(1024u, (u32)(std::sqrt((double)n) * 2.0)));
+        for (usize i = 0; i < n;) {
+            Block bl;
+            usize e = std::min(n, i + B);
+            bl.v.assign(a + i, a + e);
+            b.push_back(std::move(bl));
+            i = e;
+        }
+    }
+
+    std::pair<u32, u32> find(u32 k) const {
+        for (u32 i = 0; i < (u32)b.size(); ++i) {
+            u32 s = (u32)b[i].v.size();
+            if (k < s) return {i, k};
+            k -= s;
+        }
+        return {0, 0};
+    }
+
+    void split_block(u32 i) {
+        u32 s = (u32)b[i].v.size();
+        if (s <= 2 * B) return;
+        u32 half = s / 2;
+        Block nb;
+        nb.v.assign(b[i].v.begin() + half, b[i].v.end());
+        b[i].v.resize(half);
+        b.insert(b.begin() + i + 1, std::move(nb));
+    }
+
+    void merge_small(u32 i) {
+        if (b[i].v.size() >= B / 2) return;
+        if (i > 0 && b[i - 1].v.size() + b[i].v.size() <= 2 * B) {
+            b[i - 1].v.insert(b[i - 1].v.end(), b[i].v.begin(), b[i].v.end());
+            b.erase(b.begin() + i);
+            return;
+        }
+        if (i + 1 < b.size() && b[i].v.size() + b[i + 1].v.size() <= 2 * B) {
+            b[i].v.insert(b[i].v.end(), b[i + 1].v.begin(), b[i + 1].v.end());
+            b.erase(b.begin() + i + 1);
+        }
+    }
+
+    void rebalance(u32 i) {
+        if (b[i].v.size() > 2 * B)
+            split_block(i);
+        else
+            merge_small(i);
+    }
+
+    void reverse(u32 l, u32 r) {  // 元素下标 [l, r]（含端点）
+        auto [bi, oi] = find(l);
+        auto [bj, oj] = find(r);
+        if (bi == bj) {
+            reverse_avx2(b[bi].v.data(), oi, (usize)oj + 1);
+            return;
+        }
+        // 散块就地 SIMD 反转
+        reverse_avx2(b[bi].v.data(), oi, b[bi].v.size());
+        reverse_avx2(b[bj].v.data(), 0, (usize)oj + 1);
+        // 中间整块逐个就地 SIMD 反转（上层与下层同一内核）
+        for (u32 i = bi + 1; i < bj; ++i)
+            reverse_avx2(b[i].v.data(), 0, b[i].v.size());
+        // 反转块列表顺序（纯指针搬移，无数据 SIMD，但无懒标记）
+        std::reverse(b.begin() + bi + 1, b.begin() + bj);
+        // 端块内容交换：bi = 原前缀[0,oi) + 已反转右散块；bj = 已反转左散块 + 原后缀
+        u32 nr = oj + 1;
+        std::vector<u32> rp(b[bj].v.begin(), b[bj].v.begin() + nr);
+        std::vector<u32> lp(b[bi].v.begin() + oi, b[bi].v.end());
+        std::vector<u32> tail(b[bj].v.begin() + nr, b[bj].v.end());
+        b[bi].v.resize(oi);
+        b[bi].v.insert(b[bi].v.end(), rp.begin(), rp.end());
+        b[bj].v = std::move(lp);
+        b[bj].v.insert(b[bj].v.end(), tail.begin(), tail.end());
+        rebalance(bj);
+        rebalance(bi);
+    }
+
+    void collect(std::vector<u32>& out) const {
+        out.clear();
+        for (const Block& bl : b)
+            out.insert(out.end(), bl.v.begin(), bl.v.end());
+    }
+};
+
 // ---------------- 方法分发 ----------------
-enum Method : int { M_BRUTE = 0, M_STD, M_AVX2, M_TREAP, M_SPLAY, M_SQRT, M_COUNT };
+enum Method : int { M_BRUTE = 0, M_STD, M_AVX2, M_TREAP, M_SPLAY, M_SQRT, M_SQRT_PHYS, M_COUNT };
 static const char* METHOD_NAME[M_COUNT] = {"brute", "std", "avx2",
-                                           "treap", "splay", "sqrt"};
+                                           "treap", "splay", "sqrt", "sqrt_phys"};
 
 static inline void apply_reverse(int m, u32* a, u32 l, u32 r) {  // [l, r] 含端点
     switch (m) {
@@ -461,12 +583,14 @@ struct DS {
     Treap* t = nullptr;
     Splay* s = nullptr;
     Sqrt* q = nullptr;
+    SqrtPhys* qp = nullptr;
     std::vector<u32> arr;
 
-    DS(int m, const u32* a, usize n, u64 seed) : kind(m) {
+    DS(int m, const u32* a, usize n, u64 seed, u32 block_size = 0) : kind(m) {
         if (m == M_TREAP) t = new Treap(a, n, seed);
         if (m == M_SPLAY) s = new Splay(a, n, seed);
-        if (m == M_SQRT) q = new Sqrt(a, n, seed);
+        if (m == M_SQRT) q = new Sqrt(a, n, seed, block_size);
+        if (m == M_SQRT_PHYS) qp = new SqrtPhys(a, n, seed, block_size);
         if (m == M_BRUTE || m == M_STD || m == M_AVX2) {
             arr.assign(a, a + n);
         }
@@ -475,11 +599,13 @@ struct DS {
         delete t;
         delete s;
         delete q;
+        delete qp;
     }
     void reverse(u32 l, u32 r) {
         if (t) t->reverse(l, r);
         if (s) s->reverse(l, r);
         if (q) q->reverse(l, r);
+        if (qp) qp->reverse(l, r);
         if (!arr.empty()) apply_reverse(kind, arr.data(), l, r);
     }
     void collect(std::vector<u32>& out) {
@@ -493,6 +619,10 @@ struct DS {
         }
         if (q) {
             q->collect(out);
+            return;
+        }
+        if (qp) {
+            qp->collect(out);
             return;
         }
         out = arr;
@@ -533,10 +663,10 @@ static void verify_length(int m, u32 n, u32 L) {
     }
 }
 
-static void verify_batch(int m, u32 n, const std::vector<u32>& tmpl) {
+static void verify_batch(int m, u32 n, const std::vector<u32>& tmpl, u32 block_size = 0) {
     if (m == M_BRUTE) return;
     std::vector<u32> a = tmpl;
-    DS ds(m, tmpl.data(), n, 0xdeadbeefULL ^ (u64)m ^ n);
+    DS ds(m, tmpl.data(), n, 0xdeadbeefULL ^ (u64)m ^ n, block_size);
     u64 s = 0xabcdef0123456789ULL ^ (u64)m ^ n;
     for (u32 i = 0; i < 200; ++i) {
         u32 l = rnd(s, n);
@@ -604,9 +734,9 @@ static void measure_length() {
 
 // ---------------- batch 模式 ----------------
 static double time_batch_once(int m, u32 n, const std::vector<u32>& tmpl,
-                              u64 seed, const std::vector<u64>& w) {
+                              u64 seed, const std::vector<u64>& w, u32 block_size = 0) {
     double t0 = now_ms();
-    DS ds(m, tmpl.data(), n, seed ^ 0xbeef);
+    DS ds(m, tmpl.data(), n, seed ^ 0xbeef, block_size);
     u64 s = seed;
     for (u32 i = 0; i < OPS; ++i) {
         u32 l = rnd(s, n);
@@ -642,10 +772,37 @@ static void measure_batch() {
     }
 }
 
+// ---------------- bsweep 模式：固定 batch 场景扫块长 B ----------------
+static void measure_bsweep() {
+    const u32 BS[] = {64, 128, 256, 512, 1024, 2048, 4096, 0};  // 0 = auto
+    for (u32 n : {1u << 16, 1u << 20}) {
+        std::vector<u32> tmpl(n);
+        u64 seed = 0x0badc0deULL ^ n;
+        for (u32 i = 0; i < n; ++i) tmpl[i] = (u32)(splitmix64(seed) & 0xffff);
+        std::vector<u64> w(n);
+        u64 wseed = 0x9999999999999999ULL ^ n;
+        for (u32 i = 0; i < n; ++i) w[i] = splitmix64(wseed);
+        for (u32 B : BS) {
+            for (int m : {M_SQRT, M_SQRT_PHYS}) {
+                verify_batch(m, n, tmpl, B);
+                std::vector<double> times;
+                for (u32 r = 0; r < ROUNDS; ++r)
+                    times.push_back(time_batch_once(
+                        m, n, tmpl, 0x4444 ^ (u64)m ^ n ^ B ^ ((u64)r << 32), w, B));
+                double ms = median(times);
+                std::printf("bsweep,%u,%u,%s,%.3f\n", n, B, METHOD_NAME[m], ms);
+                std::fflush(stdout);
+            }
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     const bool only_length = argc > 1 && std::string(argv[1]) == "length";
     const bool only_batch = argc > 1 && std::string(argv[1]) == "batch";
-    if (!only_batch) measure_length();
-    if (!only_length) measure_batch();
+    const bool only_bsweep = argc > 1 && std::string(argv[1]) == "bsweep";
+    if (!only_batch && !only_bsweep) measure_length();
+    if (!only_length && !only_bsweep) measure_batch();
+    if (only_bsweep) measure_bsweep();
     return 0;
 }
