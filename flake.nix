@@ -1,5 +1,5 @@
 {
-  description = "Fenwick tree (BIT) vs plain-array brute force crossover benchmark (C++23 / Rust edition 2024)";
+  description = "Range-reverse benchmark: SIMD brute vs splay / treap / sqrt-block-list (C++23 / Rust edition 2024)";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 

@@ -1,4 +1,6 @@
 bench
 bench_rs
 bench_bare
+bench.err
+bench_rs.err
 __pycache__/
