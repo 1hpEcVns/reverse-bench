@@ -12,6 +12,7 @@ COLORS = {
     "splay": "#9467bd",
     "sqrt": "#8c564b",
     "sqrt_bitset": "#17becf",
+    "sqrt_bitset2": "#bcbd22",
 }
 MARKERS = {
     "brute": "o",
@@ -21,8 +22,9 @@ MARKERS = {
     "splay": "v",
     "sqrt": "X",
     "sqrt_bitset": "P",
+    "sqrt_bitset2": "h",
 }
-METHODS = ["brute", "std", "avx2", "treap", "splay", "sqrt", "sqrt_bitset"]
+METHODS = ["brute", "std", "avx2", "treap", "splay", "sqrt", "sqrt_bitset", "sqrt_bitset2"]
 
 
 def load(path):
@@ -74,7 +76,7 @@ def pivot_bsweep(df):
     bs = sorted({df["L"][i] for i in range(len(df["mode"])) if df["mode"][i] == "bsweep"})
     out = {}
     for n in ns:
-        data = {m: {} for m in ["sqrt", "sqrt_bitset"]}
+        data = {m: {} for m in ["sqrt", "sqrt_bitset", "sqrt_bitset2"]}
         for i in range(len(df["mode"])):
             if df["mode"][i] == "bsweep" and df["n"][i] == n:
                 data[df["method"][i]][df["L"][i]] = df["val"][i]
@@ -126,6 +128,8 @@ def draw_best(ax, sub, ylabel, title, tag):
             label="sqrt (lazy)")
     ax.plot(xs, sub["sqrt_bitset"], marker="P", markersize=4, linewidth=1.5,
             color="#17becf", linestyle="--", label="sqrt_bitset (SIMD tag toggle)")
+    ax.plot(xs, sub["sqrt_bitset2"], marker="h", markersize=4, linewidth=1.5,
+            color="#bcbd22", linestyle="-.", label="sqrt_bitset2 (2-level B-tree)")
     ax.set_xscale("log", base=2)
     ax.set_yscale("log")
     ax.set_title(title)
@@ -157,7 +161,7 @@ def ratio_axes(ax, sub_cpp, sub_rs, method, title):
 
 def draw_bsweep(ax, sub, title):
     xs = sub.index
-    for m in ["sqrt", "sqrt_bitset"]:
+    for m in ["sqrt", "sqrt_bitset", "sqrt_bitset2"]:
         ax.plot(xs, sub[m], marker=MARKERS[m], markersize=5, linewidth=1.5,
                 color=COLORS[m], label=m)
     ax.set_xscale("log", base=2)
@@ -231,7 +235,7 @@ def main():
     draw_bsweep(axes[0][1], bsr[1 << 16], "Rust block-size sweep, n=2^16")
     draw_bsweep(axes[1][0], bsc[1 << 20], "C++23 block-size sweep, n=2^20")
     draw_bsweep(axes[1][1], bsr[1 << 20], "Rust block-size sweep, n=2^20")
-    fig.suptitle("Block-size sweep: sqrt (scalar lazy) vs sqrt_bitset (SIMD lazy)", fontsize=14)
+    fig.suptitle("Block-size sweep: sqrt / sqrt_bitset / sqrt_bitset2", fontsize=14)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig("bsweep_batch.webp", dpi=150)
     plt.close(fig)
@@ -241,15 +245,17 @@ def main():
         print(f"{tag}: brute_best vs tree_best -> {crossover(sub.index, brute_best(sub), tree_best(sub))}")
         print(f"{tag}: brute_best vs sqrt -> {crossover(sub.index, brute_best(sub), sub['sqrt'])}")
         print(f"{tag}: brute_best vs sqrt_bitset -> {crossover(sub.index, brute_best(sub), sub['sqrt_bitset'])}")
+        print(f"{tag}: brute_best vs sqrt_bitset2 -> {crossover(sub.index, brute_best(sub), sub['sqrt_bitset2'])}")
     print("== batch crossover (n, m=5000) ==")
     for tag, sub in [("C++23", bc), ("Rust", br)]:
         print(f"{tag}: brute_best vs tree_best -> {crossover(sub.index, brute_best(sub), tree_best(sub))}")
         print(f"{tag}: brute_best vs sqrt -> {crossover(sub.index, brute_best(sub), sub['sqrt'])}")
         print(f"{tag}: brute_best vs sqrt_bitset -> {crossover(sub.index, brute_best(sub), sub['sqrt_bitset'])}")
+        print(f"{tag}: brute_best vs sqrt_bitset2 -> {crossover(sub.index, brute_best(sub), sub['sqrt_bitset2'])}")
     print("== bsweep best B (ms, 5000 ops + output) ==")
     for tag, d in [("C++23", bsc), ("Rust", bsr)]:
         for n in [1 << 16, 1 << 20]:
-            for m in ["sqrt", "sqrt_bitset"]:
+            for m in ["sqrt", "sqrt_bitset", "sqrt_bitset2"]:
                 sub = d[n]
                 best_i = int(np.argmin(sub[m]))
                 print(f"{tag} n={n}: {m} best B={sub.index[best_i]} ({sub[m][best_i]:.3f} ms)")

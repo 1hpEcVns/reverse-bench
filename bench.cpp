@@ -639,10 +639,410 @@ struct SqrtBitset {
     }
 };
 
+// ---------------- 两层 bitset 块状链表（sqrt_bitset2） ----------------
+// 「bitset 套 bitset」：
+//   内层：每块 1 bit 内容反转标记，打包进 u32 块描述符（pool_id | REV）。
+//   外层：每超块 2 bit（块序反转 ORD / 整块内容反转 CONT），打包进外层
+//         u32 描述符（sb_id | ORD | CONT），超块槽位是动态数组。
+// 中间整块区间 = 外层 vpermd 反转超块顺序 + vpxor 翻 ORD/CONT 两个位
+// （#superblocks/8 条指令）；端部散块先 materialize 到槽位级再按块处理。
+// find 先跳超块 total（与槽位顺序无关）再扫 ≤W 个槽位：
+// O(#superblocks + W)。超块 >2W 拆、<W/2 并；块 arena + 两级 free-list。
+struct SqrtBitset2 {
+    static constexpr u32 REV = 0x80000000u;   // 内层：块内容反转
+    static constexpr u32 ORD = 0x40000000u;   // 外层：超块内块序反转
+    static constexpr u32 CONT = 0x80000000u;  // 外层：超块内所有块内容反转
+    static constexpr u32 XMASK = ~(ORD | CONT);
+    static constexpr u32 W = 64;              // 超块目标容量（拆 >2W / 并 <W/2）
+
+    struct Block {
+        std::vector<u32> v;
+    };
+    struct SB {
+        std::vector<u32> descs;  // pool_id | REV
+        std::vector<u32> szs;
+        u32 total = 0;
+    };
+
+    std::vector<Block> pool;
+    std::vector<u32> free_ids;
+    std::vector<SB> sbpool;
+    std::vector<u32> sb_free;
+    std::vector<u32> outer;  // sb_id | ORD | CONT
+    u32 B;
+
+    struct Loc {
+        u32 opos, slot, off;
+    };
+
+    SqrtBitset2(const u32* a, usize n, u64, u32 block_size = 0) {
+        B = block_size ? block_size
+                       : std::max(64u, std::min(1024u, (u32)(std::sqrt((double)n) * 2.0)));
+        for (usize i = 0; i < n;) {
+            Block bl;
+            usize e = std::min(n, i + B);
+            bl.v.assign(a + i, a + e);
+            pool.push_back(std::move(bl));
+            i = e;
+        }
+        SB sb;
+        u32 total = 0;
+        for (u32 i = 0; i < (u32)pool.size(); ++i) {
+            if (sb.descs.size() == W) {
+                sb.total = total;
+                sbpool.push_back(std::move(sb));
+                sb = SB{};
+                total = 0;
+            }
+            sb.descs.push_back(i);
+            sb.szs.push_back((u32)pool[i].v.size());
+            total += (u32)pool[i].v.size();
+        }
+        if (!sb.descs.empty() || pool.empty()) {
+            sb.total = total;
+            sbpool.push_back(std::move(sb));
+        }
+        for (u32 i = 0; i < (u32)sbpool.size(); ++i) outer.push_back(i);
+    }
+
+    inline SB& S(u32 opos) { return sbpool[outer[opos] & XMASK]; }
+    inline const SB& S(u32 opos) const { return sbpool[outer[opos] & XMASK]; }
+
+    static void toggle_mask(u32* a, u32 l, u32 r, u32 mask) {
+        const __m256i m = _mm256_set1_epi32((int)mask);
+        u32 i = l;
+        for (; i + 8 <= r; i += 8) {
+            __m256i x = _mm256_loadu_si256((const __m256i*)(a + i));
+            x = _mm256_xor_si256(x, m);
+            _mm256_storeu_si256((__m256i*)(a + i), x);
+        }
+        for (; i < r; ++i) a[i] ^= mask;
+    }
+
+    // 把超块的 ORD/CONT 懒标记落到槽位级（ORD -> 物理反转槽位顺序，
+    // CONT -> 逐块内容位取反）
+    void materialize_sb(u32 opos) {
+        u32 d = outer[opos];
+        if (d & (ORD | CONT)) {
+            SB& s = sbpool[d & XMASK];
+            if (d & ORD) {
+                reverse_avx2(s.descs.data(), 0, s.descs.size());
+                reverse_avx2(s.szs.data(), 0, s.szs.size());
+            }
+            if (d & CONT) toggle_mask(s.descs.data(), 0, (u32)s.descs.size(), REV);
+            outer[opos] = d & XMASK;
+        }
+    }
+
+    Loc find(u32 k) const {
+        u32 oi = 0;
+        for (;;) {
+            const SB& s = S(oi);
+            if (k < s.total) break;
+            k -= s.total;
+            ++oi;
+        }
+        const SB& s = S(oi);
+        u32 n = (u32)s.descs.size();
+        u32 slot = 0;
+        if (outer[oi] & ORD) {
+            u32 j = n;
+            while (j > 0) {
+                u32 sz = s.szs[--j];
+                if (k < sz) {
+                    slot = j;
+                    break;
+                }
+                k -= sz;
+            }
+        } else {
+            u32 j = 0;
+            while (j < n) {
+                u32 sz = s.szs[j];
+                if (k < sz) {
+                    slot = j;
+                    break;
+                }
+                k -= sz;
+                ++j;
+            }
+        }
+        return {oi, slot, k};
+    }
+
+    // 元素级拆分：把超块 opos 内 slot 处的块在偏移 off 处拆成两块。
+    // 前置：超块已 materialize；off ∈ (0, sz)。
+    void split_block_at(u32 opos, u32 slot, u32 off) {
+        SB& s = S(opos);
+        u32 sz = s.szs[slot];
+        if (off <= 0 || off >= sz) return;
+        u32 id = s.descs[slot] & ~REV;
+        if (s.descs[slot] & REV) {  // 块内容若懒反转，先物化
+            reverse_avx2(pool[id].v.data(), 0, sz);
+            s.descs[slot] &= ~REV;
+        }
+        u32 nid;
+        if (!free_ids.empty()) {
+            nid = free_ids.back();
+            free_ids.pop_back();
+            pool[nid].v = std::vector<u32>();
+        } else {
+            pool.push_back(Block{});
+            nid = (u32)pool.size() - 1;
+        }
+        pool[nid].v.assign(pool[id].v.begin() + off, pool[id].v.end());
+        pool[id].v.resize(off);
+        s.szs[slot] = off;
+        s.descs.insert(s.descs.begin() + slot + 1, nid);
+        s.szs.insert(s.szs.begin() + slot + 1, sz - off);
+        if (s.descs.size() > 2 * W) split_superblock(opos);
+    }
+
+    // 物化单块内容（把块的懒反转落到物理 buffer）
+    void materialize_block(SB& s, u32 slot) {
+        if (s.descs[slot] & REV) {
+            u32 id = s.descs[slot] & ~REV;
+            reverse_avx2(pool[id].v.data(), 0, s.szs[slot]);
+            s.descs[slot] &= ~REV;
+        }
+    }
+
+    // 小块合并：触发条件是 sz < B（而不是 < B/2），合并后 ≤ 2B 就拼，
+    // 否则端块拆分产生的小块遇到满块邻居永远合不进去，块数会无界增长。
+    void merge_small_block(u32 opos, u32 slot) {
+        SB& s = S(opos);
+        u32 cnt = (u32)s.descs.size();
+        if (slot >= cnt) return;
+        u32 sz = s.szs[slot];
+        if (sz >= B) return;
+        if (slot > 0 && s.szs[slot - 1] + sz <= 2 * B) {
+            materialize_block(s, slot - 1);
+            materialize_block(s, slot);
+            u32 lid = s.descs[slot - 1] & ~REV;
+            u32 rid = s.descs[slot] & ~REV;
+            pool[lid].v.insert(pool[lid].v.end(), pool[rid].v.begin(), pool[rid].v.end());
+            s.szs[slot - 1] += sz;
+            std::vector<u32>().swap(pool[rid].v);
+            free_ids.push_back(rid);
+            s.descs.erase(s.descs.begin() + slot);
+            s.szs.erase(s.szs.begin() + slot);
+            return;
+        }
+        if (slot + 1 < cnt && sz + s.szs[slot + 1] <= 2 * B) {
+            materialize_block(s, slot);
+            materialize_block(s, slot + 1);
+            u32 lid = s.descs[slot] & ~REV;
+            u32 rid = s.descs[slot + 1] & ~REV;
+            pool[lid].v.insert(pool[lid].v.end(), pool[rid].v.begin(), pool[rid].v.end());
+            s.szs[slot] += s.szs[slot + 1];
+            std::vector<u32>().swap(pool[rid].v);
+            free_ids.push_back(rid);
+            s.descs.erase(s.descs.begin() + slot + 1);
+            s.szs.erase(s.szs.begin() + slot + 1);
+        }
+    }
+
+    // 端超块内的小块合并扫描（保持块数有界）
+    void merge_small_scan(u32 opos) {
+        SB& s = S(opos);
+        u32 k = 0;
+        while (k < (u32)s.descs.size()) {
+            if (s.szs[k] < B) {
+                u32 before = (u32)s.descs.size();
+                merge_small_block(opos, k);  // 可能吞掉 k 或 k+1
+                if ((u32)s.descs.size() == before) ++k;  // 没合并成必须前进
+            } else {
+                ++k;
+            }
+        }
+    }
+
+    void split_superblock(u32 opos) {
+        u32 sid = outer[opos] & XMASK;
+        SB& s = sbpool[sid];
+        if (s.descs.size() <= 2 * W) return;
+        u32 half = (u32)s.descs.size() / 2;
+        u32 nid;
+        if (!sb_free.empty()) {
+            nid = sb_free.back();
+            sb_free.pop_back();
+            sbpool[nid].descs.clear();
+            sbpool[nid].szs.clear();
+            sbpool[nid].total = 0;
+        } else {
+            sbpool.push_back(SB{});
+            nid = (u32)sbpool.size() - 1;
+        }
+        // push_back 可能让 sbpool 重分配，旧引用失效，重新按下标取
+        SB& ss = sbpool[sid];
+        SB& n = sbpool[nid];
+        n.descs.assign(ss.descs.begin() + half, ss.descs.end());
+        n.szs.assign(ss.szs.begin() + half, ss.szs.end());
+        u32 t = 0;
+        for (u32 x : n.szs) t += x;
+        n.total = t;
+        ss.descs.resize(half);
+        ss.szs.resize(half);
+        ss.total -= t;
+        outer.insert(outer.begin() + opos + 1, nid);
+    }
+
+    void merge_superblock(u32 opos) {
+        SB& s = S(opos);
+        if (s.descs.size() >= W / 2) return;
+        if (opos > 0) {
+            SB& L = S(opos - 1);
+            if (L.descs.size() + s.descs.size() <= 2 * W) {
+                materialize_sb(opos - 1);
+                materialize_sb(opos);
+                u32 sid = outer[opos] & XMASK;
+                L.descs.insert(L.descs.end(), s.descs.begin(), s.descs.end());
+                L.szs.insert(L.szs.end(), s.szs.begin(), s.szs.end());
+                L.total += s.total;
+                s.descs.clear();
+                s.szs.clear();
+                s.total = 0;
+                sb_free.push_back(sid);
+                outer.erase(outer.begin() + opos);
+                return;
+            }
+        }
+        if (opos + 1 < outer.size()) {
+            SB& R = S(opos + 1);
+            if (s.descs.size() + R.descs.size() <= 2 * W) {
+                materialize_sb(opos);
+                materialize_sb(opos + 1);
+                u32 rid = outer[opos + 1] & XMASK;
+                SB& ss = S(opos);
+                ss.descs.insert(ss.descs.end(), R.descs.begin(), R.descs.end());
+                ss.szs.insert(ss.szs.end(), R.szs.begin(), R.szs.end());
+                ss.total += R.total;
+                R.descs.clear();
+                R.szs.clear();
+                R.total = 0;
+                sb_free.push_back(rid);
+                outer.erase(outer.begin() + opos + 1);
+            }
+        }
+    }
+
+    void rebalance_sb(u32 opos) {
+        u32 n = (u32)S(opos).descs.size();
+        if (n > 2 * W)
+            split_superblock(opos);
+        else if (n < W / 2)
+            merge_superblock(opos);
+    }
+
+    // 同一超块内的块区间反转（块序 + 每块内容）
+    void reverse_slot_range(u32 opos, u32 si, u32 sj) {
+        SB& s = S(opos);
+        reverse_avx2(s.descs.data(), si, sj + 1);
+        reverse_avx2(s.szs.data(), si, sj + 1);
+        toggle_mask(s.descs.data(), si, sj + 1, REV);
+    }
+
+    void reverse(u32 l, u32 r) {  // 元素下标 [l, r]（含端点）
+        Loc a = find(l);
+        Loc b = find(r);
+        materialize_sb(a.opos);
+        if (b.opos != a.opos) materialize_sb(b.opos);
+        // 物化把 ORD 落到物理槽位、CONT 落到块位；之后物理==逻辑，
+        // 而 find 在 ORD 置位时返回的是物理槽位，必须先重新定位。
+        a = find(l);
+        b = find(r);
+        // 端部按元素边界拆块（可能引发超块拆分，之后重新定位）
+        if (a.off > 0) split_block_at(a.opos, a.slot, a.off);
+        Loc b2 = find(r);
+        {
+            const SB& s = S(b2.opos);
+            if (b2.off + 1 < s.szs[b2.slot]) split_block_at(b2.opos, b2.slot, b2.off + 1);
+        }
+        Loc a2 = find(l);
+        Loc b3 = find(r);
+        if (a2.opos == b3.opos) {
+            materialize_sb(a2.opos);
+            reverse_slot_range(a2.opos, a2.slot, b3.slot);
+            return;
+        }
+        u32 oi = a2.opos, oj = b3.opos;
+        u32 si = a2.slot, sj = b3.slot;
+        SB& A = S(oi);
+        SB& B = S(oj);
+        u32 ac = (u32)A.descs.size(), bc = (u32)B.descs.size();
+        u32 npre = si;             // A 前缀块数
+        u32 nrb = sj + 1;          // B 的 [0..sj] 块数
+        u32 nla = ac - si;         // A 的 [si..) 块数
+        u32 ntail = bc - sj - 1;   // B 后缀块数
+        // rp_chunk = B[0..sj] 块序 + 内容反转
+        std::vector<u32> rp_d(B.descs.begin(), B.descs.begin() + nrb);
+        std::vector<u32> rp_s(B.szs.begin(), B.szs.begin() + nrb);
+        reverse_avx2(rp_d.data(), 0, rp_d.size());
+        reverse_avx2(rp_s.data(), 0, rp_s.size());
+        toggle_mask(rp_d.data(), 0, (u32)rp_d.size(), REV);
+        // lp_chunk = A[si..) 块序 + 内容反转
+        std::vector<u32> lp_d(A.descs.begin() + si, A.descs.end());
+        std::vector<u32> lp_s(A.szs.begin() + si, A.szs.end());
+        reverse_avx2(lp_d.data(), 0, lp_d.size());
+        reverse_avx2(lp_s.data(), 0, lp_s.size());
+        toggle_mask(lp_d.data(), 0, (u32)lp_d.size(), REV);
+        // tail = B[sj+1..)
+        std::vector<u32> tail_d(B.descs.begin() + sj + 1, B.descs.end());
+        std::vector<u32> tail_s(B.szs.begin() + sj + 1, B.szs.end());
+        // 中间：外层顺序反转 + ORD/CONT 两个标记位（vpermd + vpxor）
+        reverse_avx2(outer.data(), oi + 1, oj);
+        toggle_mask(outer.data(), oi + 1, oj, ORD);
+        toggle_mask(outer.data(), oi + 1, oj, CONT);
+        // 写回 A = prefix + rp_chunk
+        A.descs.resize(npre + nrb);
+        A.szs.resize(npre + nrb);
+        std::copy(rp_d.begin(), rp_d.end(), A.descs.begin() + npre);
+        std::copy(rp_s.begin(), rp_s.end(), A.szs.begin() + npre);
+        u32 t = 0;
+        for (u32 x : A.szs) t += x;
+        A.total = t;
+        // 写回 B = lp_chunk + tail
+        B.descs.resize(nla + ntail);
+        B.szs.resize(nla + ntail);
+        std::copy(lp_d.begin(), lp_d.end(), B.descs.begin());
+        std::copy(lp_s.begin(), lp_s.end(), B.szs.begin());
+        std::copy(tail_d.begin(), tail_d.end(), B.descs.begin() + nla);
+        std::copy(tail_s.begin(), tail_s.end(), B.szs.begin() + nla);
+        t = 0;
+        for (u32 x : B.szs) t += x;
+        B.total = t;
+        // 小块合并（保持块数有界），再做超块结构维护
+        merge_small_scan(oi);
+        merge_small_scan(oj);
+        // 结构维护：先大下标
+        rebalance_sb(oj);
+        rebalance_sb(oi);
+    }
+
+    void collect(std::vector<u32>& out) const {
+        out.clear();
+        for (u32 o = 0; o < (u32)outer.size(); ++o) {
+            u32 od = outer[o];
+            const SB& s = sbpool[od & XMASK];
+            u32 n = (u32)s.descs.size();
+            for (u32 k = 0; k < n; ++k) {
+                u32 slot = (od & ORD) ? n - 1 - k : k;
+                u32 id = s.descs[slot] & ~REV;
+                bool rev = ((s.descs[slot] & REV) != 0) ^ ((od & CONT) != 0);
+                const std::vector<u32>& v = pool[id].v;
+                if (rev)
+                    out.insert(out.end(), v.rbegin(), v.rend());
+                else
+                    out.insert(out.end(), v.begin(), v.end());
+            }
+        }
+    }
+};
+
 // ---------------- 方法分发 ----------------
-enum Method : int { M_BRUTE = 0, M_STD, M_AVX2, M_TREAP, M_SPLAY, M_SQRT, M_SQRT_BITSET, M_COUNT };
+enum Method : int { M_BRUTE = 0, M_STD, M_AVX2, M_TREAP, M_SPLAY, M_SQRT, M_SQRT_BITSET, M_SQRT_BITSET2, M_COUNT };
 static const char* METHOD_NAME[M_COUNT] = {"brute", "std", "avx2",
-                                           "treap", "splay", "sqrt", "sqrt_bitset"};
+                                           "treap", "splay", "sqrt", "sqrt_bitset", "sqrt_bitset2"};
 
 static inline void apply_reverse(int m, u32* a, u32 l, u32 r) {  // [l, r] 含端点
     switch (m) {
@@ -659,6 +1059,7 @@ struct DS {
     Splay* s = nullptr;
     Sqrt* q = nullptr;
     SqrtBitset* qb = nullptr;
+    SqrtBitset2* qb2 = nullptr;
     std::vector<u32> arr;
 
     DS(int m, const u32* a, usize n, u64 seed, u32 block_size = 0) : kind(m) {
@@ -666,6 +1067,7 @@ struct DS {
         if (m == M_SPLAY) s = new Splay(a, n, seed);
         if (m == M_SQRT) q = new Sqrt(a, n, seed, block_size);
         if (m == M_SQRT_BITSET) qb = new SqrtBitset(a, n, seed, block_size);
+        if (m == M_SQRT_BITSET2) qb2 = new SqrtBitset2(a, n, seed, block_size);
         if (m == M_BRUTE || m == M_STD || m == M_AVX2) {
             arr.assign(a, a + n);
         }
@@ -675,12 +1077,14 @@ struct DS {
         delete s;
         delete q;
         delete qb;
+        delete qb2;
     }
     void reverse(u32 l, u32 r) {
         if (t) t->reverse(l, r);
         if (s) s->reverse(l, r);
         if (q) q->reverse(l, r);
         if (qb) qb->reverse(l, r);
+        if (qb2) qb2->reverse(l, r);
         if (!arr.empty()) apply_reverse(kind, arr.data(), l, r);
     }
     void collect(std::vector<u32>& out) {
@@ -698,6 +1102,10 @@ struct DS {
         }
         if (qb) {
             qb->collect(out);
+            return;
+        }
+        if (qb2) {
+            qb2->collect(out);
             return;
         }
         out = arr;
@@ -858,7 +1266,7 @@ static void measure_bsweep() {
         u64 wseed = 0x9999999999999999ULL ^ n;
         for (u32 i = 0; i < n; ++i) w[i] = splitmix64(wseed);
         for (u32 B : BS) {
-            for (int m : {M_SQRT, M_SQRT_BITSET}) {
+            for (int m : {M_SQRT, M_SQRT_BITSET, M_SQRT_BITSET2}) {
                 verify_batch(m, n, tmpl, B);
                 std::vector<double> times;
                 for (u32 r = 0; r < ROUNDS; ++r)

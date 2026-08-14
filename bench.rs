@@ -829,8 +829,459 @@ impl SqrtBitset {
     }
 }
 
+// ---------------- 两层 bitset 块状链表（sqrt_bitset2） ----------------
+// 「bitset 套 bitset」= 高度 2 的序列 B 树逻辑：
+//   内层（叶子）：每块 1 bit 内容反转标记，打包进 u32 块描述符（pool_id | REV）。
+//   外层（内部节点）：每超块 2 bit（块序反转 ORD / 整块内容反转 CONT），
+//         打包进外层 u32 描述符（sb_id | ORD | CONT），槽位是动态数组。
+// 中间整块区间 = 外层 vpermd 反转超块顺序 + vpxor 翻 ORD/CONT 两个位；
+// 端部散块先 materialize 到槽位级再按块处理。find 先跳超块 total
+// （与槽位顺序无关）再扫 ≤W 个槽位：O(#superblocks + W)。
+// 超块 >2W 拆、<W/2 并（B 树节点占用量维护）；块 arena + 两级 free-list。
+#[derive(Clone, Copy)]
+struct Loc {
+    opos: u32,
+    slot: u32,
+    off: u32,
+}
+
+struct SB {
+    descs: Vec<u32>,  // pool_id | REV
+    szs: Vec<u32>,
+    total: u32,
+}
+
+struct SqrtBitset2 {
+    pool: Vec<Vec<u32>>,  // arena：block id = 下标，删除后留空位
+    free_ids: Vec<u32>,   // 合并后回收的 pool 槽位
+    sbpool: Vec<SB>,
+    sb_free: Vec<u32>,
+    outer: Vec<u32>,      // sb_id | ORD | CONT
+    b: u32,
+}
+
+impl SqrtBitset2 {
+    const REV: u32 = 0x8000_0000;   // 内层：块内容反转
+    const ORD: u32 = 0x4000_0000;   // 外层：超块内块序反转
+    const CONT: u32 = 0x8000_0000;  // 外层：超块内所有块内容反转
+    const XMASK: u32 = !(Self::ORD | Self::CONT);
+    const W: u32 = 64;              // 超块目标容量（拆 >2W / 并 <W/2）
+
+    fn new(a: &[u32], _seed: u64, block_size: u32) -> SqrtBitset2 {
+        let n = a.len() as f64;
+        let auto = ((n.sqrt() * 2.0) as u32).clamp(64, 1024);
+        let b = (if block_size != 0 { block_size } else { auto }) as usize;
+        let mut pool = Vec::new();
+        let mut i = 0usize;
+        while i < a.len() {
+            let e = (i + b).min(a.len());
+            pool.push(a[i..e].to_vec());
+            i = e;
+        }
+        let mut sb = SB { descs: Vec::new(), szs: Vec::new(), total: 0 };
+        let mut sbpool = Vec::new();
+        let mut total = 0u32;
+        for (i, v) in pool.iter().enumerate() {
+            if sb.descs.len() == Self::W as usize {
+                sb.total = total;
+                sbpool.push(sb);
+                sb = SB { descs: Vec::new(), szs: Vec::new(), total: 0 };
+                total = 0;
+            }
+            sb.descs.push(i as u32);
+            sb.szs.push(v.len() as u32);
+            total += v.len() as u32;
+        }
+        if !sb.descs.is_empty() || pool.is_empty() {
+            sb.total = total;
+            sbpool.push(sb);
+        }
+        let outer: Vec<u32> = (0..sbpool.len() as u32).collect();
+        SqrtBitset2 {
+            pool,
+            free_ids: Vec::new(),
+            sbpool,
+            sb_free: Vec::new(),
+            outer,
+            b: b as u32,
+        }
+    }
+
+    fn toggle_mask(a: &mut [u32], l: u32, r: u32, mask: u32) {
+        unsafe {
+            let m = _mm256_set1_epi32(mask as i32);
+            let mut i = l as usize;
+            let rr = r as usize;
+            while i + 8 <= rr {
+                let p = a.as_mut_ptr().add(i);
+                let x = _mm256_loadu_si256(p as *const __m256i);
+                let y = _mm256_xor_si256(x, m);
+                _mm256_storeu_si256(p as *mut __m256i, y);
+                i += 8;
+            }
+            for d in &mut a[i..rr] {
+                *d ^= mask;
+            }
+        }
+    }
+
+    // 把超块的 ORD/CONT 懒标记落到槽位级
+    fn materialize_sb(&mut self, opos: u32) {
+        let d = self.outer[opos as usize];
+        if d & (Self::ORD | Self::CONT) != 0 {
+            let sid = (d & Self::XMASK) as usize;
+            if d & Self::ORD != 0 {
+                unsafe {
+                    let nd = self.sbpool[sid].descs.len();
+                    reverse_avx2(&mut self.sbpool[sid].descs, 0, nd);
+                    let ns = self.sbpool[sid].szs.len();
+                    reverse_avx2(&mut self.sbpool[sid].szs, 0, ns);
+                }
+            }
+            if d & Self::CONT != 0 {
+                let n = self.sbpool[sid].descs.len() as u32;
+                Self::toggle_mask(&mut self.sbpool[sid].descs, 0, n, Self::REV);
+            }
+            self.outer[opos as usize] = d & Self::XMASK;
+        }
+    }
+
+    fn find(&self, mut k: u32) -> Loc {
+        let mut oi = 0usize;
+        loop {
+            let sid = (self.outer[oi] & Self::XMASK) as usize;
+            let s = &self.sbpool[sid];
+            if k < s.total {
+                break;
+            }
+            k -= s.total;
+            oi += 1;
+        }
+        let sid = (self.outer[oi] & Self::XMASK) as usize;
+        let s = &self.sbpool[sid];
+        let n = s.descs.len() as u32;
+        let mut slot = 0u32;
+        if self.outer[oi] & Self::ORD != 0 {
+            let mut j = n;
+            while j > 0 {
+                j -= 1;
+                let sz = s.szs[j as usize];
+                if k < sz {
+                    slot = j;
+                    break;
+                }
+                k -= sz;
+            }
+        } else {
+            let mut j = 0u32;
+            while j < n {
+                let sz = s.szs[j as usize];
+                if k < sz {
+                    slot = j;
+                    break;
+                }
+                k -= sz;
+                j += 1;
+            }
+        }
+        Loc { opos: oi as u32, slot, off: k }
+    }
+
+    fn materialize_block(&mut self, opos: u32, slot: u32) {
+        let sid = (self.outer[opos as usize] & Self::XMASK) as usize;
+        if self.sbpool[sid].descs[slot as usize] & Self::REV != 0 {
+            let id = (self.sbpool[sid].descs[slot as usize] & !Self::REV) as usize;
+            let sz = self.sbpool[sid].szs[slot as usize] as usize;
+            unsafe { reverse_avx2(&mut self.pool[id], 0, sz) };
+            self.sbpool[sid].descs[slot as usize] &= !Self::REV;
+        }
+    }
+
+    // 元素级拆分：把超块 opos 内 slot 处的块在偏移 off 处拆成两块
+    fn split_block_at(&mut self, opos: u32, slot: u32, off: u32) {
+        let sid = (self.outer[opos as usize] & Self::XMASK) as usize;
+        let sz = self.sbpool[sid].szs[slot as usize];
+        if off == 0 || off >= sz {
+            return;
+        }
+        let id = (self.sbpool[sid].descs[slot as usize] & !Self::REV) as usize;
+        if self.sbpool[sid].descs[slot as usize] & Self::REV != 0 {
+            let len = self.pool[id].len();
+            unsafe { reverse_avx2(&mut self.pool[id], 0, len) };
+            self.sbpool[sid].descs[slot as usize] &= !Self::REV;
+        }
+        let suffix = self.pool[id].split_off(off as usize);
+        let nid = if let Some(f) = self.free_ids.pop() {
+            self.pool[f as usize] = suffix;
+            f
+        } else {
+            self.pool.push(suffix);
+            (self.pool.len() - 1) as u32
+        };
+        self.sbpool[sid].szs[slot as usize] = off;
+        self.sbpool[sid].descs.insert(slot as usize + 1, nid);
+        self.sbpool[sid].szs.insert(slot as usize + 1, sz - off);
+        if self.sbpool[sid].descs.len() > 2 * Self::W as usize {
+            self.split_superblock(opos);
+        }
+    }
+
+    fn split_superblock(&mut self, opos: u32) {
+        let sid = (self.outer[opos as usize] & Self::XMASK) as usize;
+        if self.sbpool[sid].descs.len() <= 2 * Self::W as usize {
+            return;
+        }
+        let half = self.sbpool[sid].descs.len() / 2;
+        let nid = if let Some(f) = self.sb_free.pop() {
+            self.sbpool[f as usize].descs.clear();
+            self.sbpool[f as usize].szs.clear();
+            self.sbpool[f as usize].total = 0;
+            f
+        } else {
+            self.sbpool.push(SB { descs: Vec::new(), szs: Vec::new(), total: 0 });
+            (self.sbpool.len() - 1) as u32
+        };
+        let n = nid as usize;
+        self.sbpool[n].descs = self.sbpool[sid].descs.split_off(half);
+        self.sbpool[n].szs = self.sbpool[sid].szs.split_off(half);
+        let t: u32 = self.sbpool[n].szs.iter().sum();
+        self.sbpool[n].total = t;
+        self.sbpool[sid].total -= t;
+        self.outer.insert(opos as usize + 1, nid);
+    }
+
+    // 小块合并：触发条件是 sz < B，合并后 ≤ 2B 就拼（保持块数有界）
+    fn merge_small_block(&mut self, opos: u32, slot: u32) {
+        let sid = (self.outer[opos as usize] & Self::XMASK) as usize;
+        let cnt = self.sbpool[sid].descs.len() as u32;
+        if slot >= cnt {
+            return;
+        }
+        let sz = self.sbpool[sid].szs[slot as usize];
+        if sz >= self.b {
+            return;
+        }
+        if slot > 0 && self.sbpool[sid].szs[slot as usize - 1] + sz <= 2 * self.b {
+            self.materialize_block(opos, slot - 1);
+            self.materialize_block(opos, slot);
+            let lid = (self.sbpool[sid].descs[slot as usize - 1] & !Self::REV) as usize;
+            let rid = (self.sbpool[sid].descs[slot as usize] & !Self::REV) as usize;
+            let mut rhs = std::mem::take(&mut self.pool[rid]);
+            self.pool[lid].append(&mut rhs);
+            self.sbpool[sid].szs[slot as usize - 1] += sz;
+            self.free_ids.push(rid as u32);
+            self.sbpool[sid].descs.remove(slot as usize);
+            self.sbpool[sid].szs.remove(slot as usize);
+            return;
+        }
+        if slot + 1 < cnt && sz + self.sbpool[sid].szs[slot as usize + 1] <= 2 * self.b {
+            self.materialize_block(opos, slot);
+            self.materialize_block(opos, slot + 1);
+            let lid = (self.sbpool[sid].descs[slot as usize] & !Self::REV) as usize;
+            let rid = (self.sbpool[sid].descs[slot as usize + 1] & !Self::REV) as usize;
+            let mut rhs = std::mem::take(&mut self.pool[rid]);
+            self.pool[lid].append(&mut rhs);
+            self.sbpool[sid].szs[slot as usize] += self.sbpool[sid].szs[slot as usize + 1];
+            self.free_ids.push(rid as u32);
+            self.sbpool[sid].descs.remove(slot as usize + 1);
+            self.sbpool[sid].szs.remove(slot as usize + 1);
+        }
+    }
+
+    fn merge_small_scan(&mut self, opos: u32) {
+        let mut k = 0u32;
+        loop {
+            let sid = (self.outer[opos as usize] & Self::XMASK) as usize;
+            if k >= self.sbpool[sid].descs.len() as u32 {
+                break;
+            }
+            if self.sbpool[sid].szs[k as usize] < self.b {
+                let before = self.sbpool[sid].descs.len();
+                self.merge_small_block(opos, k);
+                if self.sbpool[sid].descs.len() == before {
+                    k += 1;  // 没合并成必须前进
+                }
+            } else {
+                k += 1;
+            }
+        }
+    }
+
+    fn merge_superblock(&mut self, opos: u32) {
+        let sid = (self.outer[opos as usize] & Self::XMASK) as usize;
+        if self.sbpool[sid].descs.len() < Self::W as usize / 2 {
+            if opos > 0 {
+                let lsid = (self.outer[opos as usize - 1] & Self::XMASK) as usize;
+                if self.sbpool[lsid].descs.len() + self.sbpool[sid].descs.len()
+                    <= 2 * Self::W as usize
+                {
+                    self.materialize_sb(opos - 1);
+                    self.materialize_sb(opos);
+                    let ssid = (self.outer[opos as usize] & Self::XMASK) as usize;
+                    let mut rhs = std::mem::take(&mut self.sbpool[ssid].descs);
+                    let mut rsz = std::mem::take(&mut self.sbpool[ssid].szs);
+                    self.sbpool[lsid].descs.append(&mut rhs);
+                    self.sbpool[lsid].szs.append(&mut rsz);
+                    self.sbpool[lsid].total += self.sbpool[ssid].total;
+                    self.sbpool[ssid].total = 0;
+                    self.sb_free.push(ssid as u32);
+                    self.outer.remove(opos as usize);
+                    return;
+                }
+            }
+            if opos + 1 < self.outer.len() as u32 {
+                let rsid = (self.outer[opos as usize + 1] & Self::XMASK) as usize;
+                if self.sbpool[sid].descs.len() + self.sbpool[rsid].descs.len()
+                    <= 2 * Self::W as usize
+                {
+                    self.materialize_sb(opos);
+                    self.materialize_sb(opos + 1);
+                    let ssid = (self.outer[opos as usize] & Self::XMASK) as usize;
+                    let rrid = (self.outer[opos as usize + 1] & Self::XMASK) as usize;
+                    let mut rhs = std::mem::take(&mut self.sbpool[rrid].descs);
+                    let mut rsz = std::mem::take(&mut self.sbpool[rrid].szs);
+                    self.sbpool[ssid].descs.append(&mut rhs);
+                    self.sbpool[ssid].szs.append(&mut rsz);
+                    self.sbpool[ssid].total += self.sbpool[rrid].total;
+                    self.sbpool[rrid].total = 0;
+                    self.sb_free.push(rrid as u32);
+                    self.outer.remove(opos as usize + 1);
+                }
+            }
+        }
+    }
+
+    fn rebalance_sb(&mut self, opos: u32) {
+        let sid = (self.outer[opos as usize] & Self::XMASK) as usize;
+        if self.sbpool[sid].descs.len() > 2 * Self::W as usize {
+            self.split_superblock(opos);
+        } else if self.sbpool[sid].descs.len() < Self::W as usize / 2 {
+            self.merge_superblock(opos);
+        }
+    }
+
+    // 同一超块内的块区间反转（块序 + 每块内容）
+    fn reverse_slot_range(&mut self, opos: u32, si: u32, sj: u32) {
+        let sid = (self.outer[opos as usize] & Self::XMASK) as usize;
+        unsafe {
+            reverse_avx2(&mut self.sbpool[sid].descs, si as usize, sj as usize + 1);
+            reverse_avx2(&mut self.sbpool[sid].szs, si as usize, sj as usize + 1);
+        }
+        Self::toggle_mask(&mut self.sbpool[sid].descs, si, sj + 1, Self::REV);
+    }
+
+    fn reverse(&mut self, l: u32, r: u32) {
+        let mut a = self.find(l);
+        let mut b = self.find(r);
+        self.materialize_sb(a.opos);
+        if b.opos != a.opos {
+            self.materialize_sb(b.opos);
+        }
+        // 物化把 ORD 落到物理槽位、CONT 落到块位；之后物理==逻辑，
+        // 而 find 在 ORD 置位时返回的是物理槽位，必须先重新定位。
+        a = self.find(l);
+        b = self.find(r);
+        if a.off > 0 {
+            self.split_block_at(a.opos, a.slot, a.off);
+        }
+        let b2 = self.find(r);
+        {
+            let sid = (self.outer[b2.opos as usize] & Self::XMASK) as usize;
+            if b2.off + 1 < self.sbpool[sid].szs[b2.slot as usize] {
+                self.split_block_at(b2.opos, b2.slot, b2.off + 1);
+            }
+        }
+        let a2 = self.find(l);
+        let b3 = self.find(r);
+        if a2.opos == b3.opos {
+            self.materialize_sb(a2.opos);
+            self.reverse_slot_range(a2.opos, a2.slot, b3.slot);
+            return;
+        }
+        let oi = a2.opos;
+        let oj = b3.opos;
+        let si = a2.slot;
+        let sj = b3.slot;
+        let ai = (self.outer[oi as usize] & Self::XMASK) as usize;
+        let di = (self.outer[oj as usize] & Self::XMASK) as usize;
+        let ac = self.sbpool[ai].descs.len() as u32;
+        let bc = self.sbpool[di].descs.len() as u32;
+        let npre = si;
+        let nrb = sj + 1;
+        let nla = ac - si;
+        let _ntail = bc - sj - 1;
+        // rp_chunk = B[0..sj] 块序 + 内容反转
+        let mut rp_d = self.sbpool[di].descs[..nrb as usize].to_vec();
+        let mut rp_s = self.sbpool[di].szs[..nrb as usize].to_vec();
+        unsafe {
+            let nd = rp_d.len();
+            reverse_avx2(&mut rp_d, 0, nd);
+            let ns = rp_s.len();
+            reverse_avx2(&mut rp_s, 0, ns);
+        }
+        Self::toggle_mask(&mut rp_d, 0, nrb, Self::REV);
+        // lp_chunk = A[si..) 块序 + 内容反转
+        let mut lp_d = self.sbpool[ai].descs[si as usize..].to_vec();
+        let mut lp_s = self.sbpool[ai].szs[si as usize..].to_vec();
+        unsafe {
+            let nd = lp_d.len();
+            reverse_avx2(&mut lp_d, 0, nd);
+            let ns = lp_s.len();
+            reverse_avx2(&mut lp_s, 0, ns);
+        }
+        Self::toggle_mask(&mut lp_d, 0, nla, Self::REV);
+        // tail = B[sj+1..)
+        let tail_d = self.sbpool[di].descs[sj as usize + 1..].to_vec();
+        let tail_s = self.sbpool[di].szs[sj as usize + 1..].to_vec();
+        // 中间：外层顺序反转 + ORD/CONT 两个标记位（vpermd + vpxor）
+        unsafe {
+            reverse_avx2(&mut self.outer, (oi + 1) as usize, oj as usize);
+        }
+        Self::toggle_mask(&mut self.outer, oi + 1, oj, Self::ORD);
+        Self::toggle_mask(&mut self.outer, oi + 1, oj, Self::CONT);
+        // 写回 A = prefix + rp_chunk
+        self.sbpool[ai].descs.truncate(npre as usize);
+        self.sbpool[ai].descs.extend_from_slice(&rp_d);
+        self.sbpool[ai].szs.truncate(npre as usize);
+        self.sbpool[ai].szs.extend_from_slice(&rp_s);
+        self.sbpool[ai].total = self.sbpool[ai].szs.iter().sum();
+        // 写回 B = lp_chunk + tail
+        self.sbpool[di].descs = lp_d;
+        self.sbpool[di].descs.extend_from_slice(&tail_d);
+        self.sbpool[di].szs = lp_s;
+        self.sbpool[di].szs.extend_from_slice(&tail_s);
+        self.sbpool[di].total = self.sbpool[di].szs.iter().sum();
+        // 小块合并（保持块数有界），再做超块结构维护
+        self.merge_small_scan(oi);
+        self.merge_small_scan(oj);
+        self.rebalance_sb(oj);
+        self.rebalance_sb(oi);
+    }
+
+    fn collect(&self, out: &mut Vec<u32>) {
+        out.clear();
+        for o in 0..self.outer.len() {
+            let od = self.outer[o];
+            let s = &self.sbpool[(od & Self::XMASK) as usize];
+            let n = s.descs.len() as u32;
+            for k in 0..n {
+                let slot = if od & Self::ORD != 0 { n - 1 - k } else { k };
+                let id = (s.descs[slot as usize] & !Self::REV) as usize;
+                let rev = (s.descs[slot as usize] & Self::REV != 0) ^ (od & Self::CONT != 0);
+                let v = &self.pool[id];
+                if rev {
+                    out.extend(v.iter().rev());
+                } else {
+                    out.extend_from_slice(v);
+                }
+            }
+        }
+    }
+}
+
 // ---------------- 方法分发 ----------------
-const METHODS: [&str; 7] = ["brute", "std", "avx2", "treap", "splay", "sqrt", "sqrt_bitset"];
+const METHODS: [&str; 8] =
+    ["brute", "std", "avx2", "treap", "splay", "sqrt", "sqrt_bitset", "sqrt_bitset2"];
 
 #[inline(always)]
 unsafe fn apply_reverse(m: usize, a: &mut [u32], l: u32, r: u32) {
@@ -848,6 +1299,7 @@ enum DS {
     Splay(Splay),
     Sqrt(Sqrt),
     SqrtBitset(SqrtBitset),
+    SqrtBitset2(SqrtBitset2),
 }
 
 impl DS {
@@ -861,6 +1313,7 @@ impl DS {
             4 => DS::Splay(Splay::new(a, seed)),
             5 => DS::Sqrt(Sqrt::new(a, seed, block_size)),
             6 => DS::SqrtBitset(SqrtBitset::new(a, seed, block_size)),
+            7 => DS::SqrtBitset2(SqrtBitset2::new(a, seed, block_size)),
             _ => unreachable!(),
         }
     }
@@ -872,6 +1325,7 @@ impl DS {
             DS::Splay(s) => s.reverse(l, r),
             DS::Sqrt(q) => q.reverse(l, r),
             DS::SqrtBitset(q) => q.reverse(l, r),
+            DS::SqrtBitset2(q) => q.reverse(l, r),
         }
     }
 
@@ -885,6 +1339,7 @@ impl DS {
             DS::Splay(s) => s.collect(out),
             DS::Sqrt(q) => q.collect(out),
             DS::SqrtBitset(q) => q.collect(out),
+            DS::SqrtBitset2(q) => q.collect(out),
         }
     }
 
@@ -1061,7 +1516,7 @@ fn measure_bsweep() {
         let mut wseed = 0x9999_9999_9999_9999u64 ^ n as u64;
         let w: Vec<u64> = (0..n).map(|_| splitmix64(&mut wseed)).collect();
         for &b in &bs {
-            for m in [5usize, 6] {
+            for m in [5usize, 6, 7] {
                 verify_batch(m, n, &tmpl, b);
                 let mut times = Vec::new();
                 for r in 0..ROUNDS {
