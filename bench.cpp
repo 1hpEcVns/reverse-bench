@@ -471,103 +471,178 @@ struct Sqrt {
 // ---------------- 物理 SIMD 块状链表（无懒标记） ----------------
 // 上层（整块）与下层（散块）用同一个 reverse_avx2 内核，块内容始终物理有序；
 // 整块反转 = 逐块 SIMD 就地反转 + 块列表顺序反转（O(#blocks) 指针搬移）。
-struct SqrtPhys {
+// ---------------- bitset 思想懒标记块状链表（sqrt_bitset） ----------------
+// 懒标记打包进 u32 块描述符的最高位（desc = pool_id | rev<<31）：
+//  - 中间整块的区间翻转 = 一次 vpxor 0x80000000（每 8 块一条 SIMD 指令）；
+//  - 块顺序反转 = 同一个 reverse_avx2（vpermd）直接作用于 desc，标记随块走；
+//  - 块本体放 arena（pool 只增不减），desc/szs 是 u32 数组，split/merge 只是
+//    vector insert/erase，不再有独立的 bit insert/remove。
+struct SqrtBitset {
     struct Block {
         std::vector<u32> v;
     };
-    std::vector<Block> b;
+    static constexpr u32 REV = 0x80000000u;
+    std::vector<Block> pool;  // arena：block id = 下标，删除后留空位
+    std::vector<u32> desc;    // 逻辑块顺序：pool_id | (懒反转 << 31)
+    std::vector<u32> szs;     // 与 desc 平行的块大小（find 用，避免二次间接）
+    std::vector<u32> free_ids;  // 合并后回收的 pool 槽位
     u32 B;
 
-    SqrtPhys(const u32* a, usize n, u64, u32 block_size = 0) {
+    SqrtBitset(const u32* a, usize n, u64, u32 block_size = 0) {
         B = block_size ? block_size
                        : std::max(64u, std::min(1024u, (u32)(std::sqrt((double)n) * 2.0)));
         for (usize i = 0; i < n;) {
             Block bl;
             usize e = std::min(n, i + B);
             bl.v.assign(a + i, a + e);
-            b.push_back(std::move(bl));
+            pool.push_back(std::move(bl));
+            desc.push_back((u32)pool.size() - 1);
+            szs.push_back((u32)(e - i));
             i = e;
         }
     }
 
-    std::pair<u32, u32> find(u32 k) const {
-        for (u32 i = 0; i < (u32)b.size(); ++i) {
-            u32 s = (u32)b[i].v.size();
+    std::pair<u32, u32> find(u32 k) const {  // 逻辑位置 -> (位置, 块内偏移)
+        for (u32 i = 0; i < (u32)desc.size(); ++i) {
+            u32 s = szs[i];
             if (k < s) return {i, k};
             k -= s;
         }
         return {0, 0};
     }
 
-    void split_block(u32 i) {
-        u32 s = (u32)b[i].v.size();
+    inline bool bit_test(u32 pos) const { return desc[pos] & REV; }
+
+    // 区间懒标记翻转：整块区间 = vpxor 0x80000000（bitset 思想，8 块/指令）
+    void toggle_range(u32 l, u32 r) {
+        const __m256i m = _mm256_set1_epi32((int)REV);
+        u32 i = l;
+        for (; i + 8 <= r; i += 8) {
+            __m256i x = _mm256_loadu_si256((const __m256i*)(desc.data() + i));
+            x = _mm256_xor_si256(x, m);
+            _mm256_storeu_si256((__m256i*)(desc.data() + i), x);
+        }
+        for (; i < r; ++i) desc[i] ^= REV;
+    }
+
+    inline void materialize(u32 pos) {
+        if (desc[pos] & REV) {
+            reverse_avx2(pool[desc[pos] & ~REV].v.data(), 0, szs[pos]);
+            desc[pos] &= ~REV;
+        }
+    }
+
+    void split_block(u32 pos) {
+        u32 s = szs[pos];
         if (s <= 2 * B) return;
         u32 half = s / 2;
+        u32 id = desc[pos] & ~REV;  // 端块必已 materialize（rev=0）
         Block nb;
-        nb.v.assign(b[i].v.begin() + half, b[i].v.end());
-        b[i].v.resize(half);
-        b.insert(b.begin() + i + 1, std::move(nb));
+        nb.v.assign(pool[id].v.begin() + half, pool[id].v.end());
+        pool[id].v.resize(half);
+        szs[pos] = half;
+        u32 nid;
+        if (!free_ids.empty()) {
+            nid = free_ids.back();
+            free_ids.pop_back();
+            pool[nid].v = std::move(nb.v);
+        } else {
+            pool.push_back(std::move(nb));
+            nid = (u32)pool.size() - 1;
+        }
+        desc.insert(desc.begin() + pos + 1, nid);
+        szs.insert(szs.begin() + pos + 1, s - half);
     }
 
-    void merge_small(u32 i) {
-        if (b[i].v.size() >= B / 2) return;
-        if (i > 0 && b[i - 1].v.size() + b[i].v.size() <= 2 * B) {
-            b[i - 1].v.insert(b[i - 1].v.end(), b[i].v.begin(), b[i].v.end());
-            b.erase(b.begin() + i);
+    void merge_small(u32 pos) {
+        u32 s = szs[pos];
+        if (s >= B / 2) return;
+        if (pos > 0 && szs[pos - 1] + s <= 2 * B) {
+            materialize(pos - 1);
+            materialize(pos);
+            u32 idL = desc[pos - 1] & ~REV;
+            u32 idR = desc[pos] & ~REV;
+            Block& L = pool[idL];
+            Block& R = pool[idR];
+            L.v.insert(L.v.end(), R.v.begin(), R.v.end());
+            szs[pos - 1] += s;
+            std::vector<u32>().swap(R.v);
+            free_ids.push_back(idR);
+            desc.erase(desc.begin() + pos);
+            szs.erase(szs.begin() + pos);
             return;
         }
-        if (i + 1 < b.size() && b[i].v.size() + b[i + 1].v.size() <= 2 * B) {
-            b[i].v.insert(b[i].v.end(), b[i + 1].v.begin(), b[i + 1].v.end());
-            b.erase(b.begin() + i + 1);
+        if (pos + 1 < desc.size() && s + szs[pos + 1] <= 2 * B) {
+            materialize(pos);
+            materialize(pos + 1);
+            u32 idL = desc[pos] & ~REV;
+            u32 idR = desc[pos + 1] & ~REV;
+            Block& L = pool[idL];
+            Block& R = pool[idR];
+            L.v.insert(L.v.end(), R.v.begin(), R.v.end());
+            szs[pos] += szs[pos + 1];
+            std::vector<u32>().swap(R.v);
+            free_ids.push_back(idR);
+            desc.erase(desc.begin() + pos + 1);
+            szs.erase(szs.begin() + pos + 1);
         }
     }
 
-    void rebalance(u32 i) {
-        if (b[i].v.size() > 2 * B)
-            split_block(i);
+    void rebalance(u32 pos) {
+        if (szs[pos] > 2 * B)
+            split_block(pos);
         else
-            merge_small(i);
+            merge_small(pos);
     }
 
     void reverse(u32 l, u32 r) {  // 元素下标 [l, r]（含端点）
         auto [bi, oi] = find(l);
         auto [bj, oj] = find(r);
         if (bi == bj) {
-            reverse_avx2(b[bi].v.data(), oi, (usize)oj + 1);
+            materialize(bi);
+            reverse_avx2(pool[desc[bi] & ~REV].v.data(), oi, (usize)oj + 1);
             return;
         }
-        // 散块就地 SIMD 反转
-        reverse_avx2(b[bi].v.data(), oi, b[bi].v.size());
-        reverse_avx2(b[bj].v.data(), 0, (usize)oj + 1);
-        // 中间整块逐个就地 SIMD 反转（上层与下层同一内核）
-        for (u32 i = bi + 1; i < bj; ++i)
-            reverse_avx2(b[i].v.data(), 0, b[i].v.size());
-        // 反转块列表顺序（纯指针搬移，无数据 SIMD，但无懒标记）
-        std::reverse(b.begin() + bi + 1, b.begin() + bj);
-        // 端块内容交换：bi = 原前缀[0,oi) + 已反转右散块；bj = 已反转左散块 + 原后缀
-        u32 nr = oj + 1;
-        std::vector<u32> rp(b[bj].v.begin(), b[bj].v.begin() + nr);
-        std::vector<u32> lp(b[bi].v.begin() + oi, b[bi].v.end());
-        std::vector<u32> tail(b[bj].v.begin() + nr, b[bj].v.end());
-        b[bi].v.resize(oi);
-        b[bi].v.insert(b[bi].v.end(), rp.begin(), rp.end());
-        b[bj].v = std::move(lp);
-        b[bj].v.insert(b[bj].v.end(), tail.begin(), tail.end());
+        materialize(bi);
+        materialize(bj);
+        Block& A = pool[desc[bi] & ~REV];
+        Block& D = pool[desc[bj] & ~REV];
+        u32 nr = oj + 1;  // 右散块参与翻转的前缀长度
+        std::vector<u32> rp(D.v.begin(), D.v.begin() + nr);
+        reverse_avx2(rp.data(), 0, rp.size());
+        std::vector<u32> lp(A.v.begin() + oi, A.v.end());
+        reverse_avx2(lp.data(), 0, lp.size());
+        std::vector<u32> tail(D.v.begin() + nr, D.v.end());
+        A.v.resize(oi);
+        A.v.insert(A.v.end(), rp.begin(), rp.end());
+        D.v = std::move(lp);
+        D.v.insert(D.v.end(), tail.begin(), tail.end());
+        szs[bi] = (u32)A.v.size();
+        szs[bj] = (u32)D.v.size();
+        // 中间块：vpermd 反转 desc/szs（标记随块走），再 vpxor 区间翻转标记
+        reverse_avx2(desc.data(), bi + 1, bj);
+        reverse_avx2(szs.data(), bi + 1, bj);
+        toggle_range(bi + 1, bj);
         rebalance(bj);
         rebalance(bi);
     }
 
     void collect(std::vector<u32>& out) const {
         out.clear();
-        for (const Block& bl : b)
-            out.insert(out.end(), bl.v.begin(), bl.v.end());
+        for (u32 i = 0; i < (u32)desc.size(); ++i) {
+            const std::vector<u32>& v = pool[desc[i] & ~REV].v;
+            if (desc[i] & REV)
+                out.insert(out.end(), v.rbegin(), v.rend());
+            else
+                out.insert(out.end(), v.begin(), v.end());
+        }
     }
 };
 
 // ---------------- 方法分发 ----------------
-enum Method : int { M_BRUTE = 0, M_STD, M_AVX2, M_TREAP, M_SPLAY, M_SQRT, M_SQRT_PHYS, M_COUNT };
+enum Method : int { M_BRUTE = 0, M_STD, M_AVX2, M_TREAP, M_SPLAY, M_SQRT, M_SQRT_BITSET, M_COUNT };
 static const char* METHOD_NAME[M_COUNT] = {"brute", "std", "avx2",
-                                           "treap", "splay", "sqrt", "sqrt_phys"};
+                                           "treap", "splay", "sqrt", "sqrt_bitset"};
 
 static inline void apply_reverse(int m, u32* a, u32 l, u32 r) {  // [l, r] 含端点
     switch (m) {
@@ -583,14 +658,14 @@ struct DS {
     Treap* t = nullptr;
     Splay* s = nullptr;
     Sqrt* q = nullptr;
-    SqrtPhys* qp = nullptr;
+    SqrtBitset* qb = nullptr;
     std::vector<u32> arr;
 
     DS(int m, const u32* a, usize n, u64 seed, u32 block_size = 0) : kind(m) {
         if (m == M_TREAP) t = new Treap(a, n, seed);
         if (m == M_SPLAY) s = new Splay(a, n, seed);
         if (m == M_SQRT) q = new Sqrt(a, n, seed, block_size);
-        if (m == M_SQRT_PHYS) qp = new SqrtPhys(a, n, seed, block_size);
+        if (m == M_SQRT_BITSET) qb = new SqrtBitset(a, n, seed, block_size);
         if (m == M_BRUTE || m == M_STD || m == M_AVX2) {
             arr.assign(a, a + n);
         }
@@ -599,13 +674,13 @@ struct DS {
         delete t;
         delete s;
         delete q;
-        delete qp;
+        delete qb;
     }
     void reverse(u32 l, u32 r) {
         if (t) t->reverse(l, r);
         if (s) s->reverse(l, r);
         if (q) q->reverse(l, r);
-        if (qp) qp->reverse(l, r);
+        if (qb) qb->reverse(l, r);
         if (!arr.empty()) apply_reverse(kind, arr.data(), l, r);
     }
     void collect(std::vector<u32>& out) {
@@ -621,8 +696,8 @@ struct DS {
             q->collect(out);
             return;
         }
-        if (qp) {
-            qp->collect(out);
+        if (qb) {
+            qb->collect(out);
             return;
         }
         out = arr;
@@ -783,7 +858,7 @@ static void measure_bsweep() {
         u64 wseed = 0x9999999999999999ULL ^ n;
         for (u32 i = 0; i < n; ++i) w[i] = splitmix64(wseed);
         for (u32 B : BS) {
-            for (int m : {M_SQRT, M_SQRT_PHYS}) {
+            for (int m : {M_SQRT, M_SQRT_BITSET}) {
                 verify_batch(m, n, tmpl, B);
                 std::vector<double> times;
                 for (u32 r = 0; r < ROUNDS; ++r)
